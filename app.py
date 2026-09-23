@@ -616,6 +616,7 @@ def download_youtube_audio(url: str, output_dir: str, manager: JobManager) -> Tu
     ydl_opts = {
         "format": "bestaudio/best",
         "outtmpl": template_path,
+        "cookiefile": "www.youtube.com_cookies.txt",
         "quiet": True,
         "no_warnings": True,
         "progress_hooks": [yt_hook],

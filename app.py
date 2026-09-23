@@ -20,6 +20,7 @@ import re
 import sys
 import time
 import json
+import urllib.request
 import logging
 import threading
 import subprocess
@@ -475,7 +476,14 @@ class JobManager:
             if len(self.logs) > 300:
                 self.logs.pop(0)
 
-    def start_job(self, url: str, chunk_duration_sec: int, api_key_1: str = "", api_key_2: str = "") -> Tuple[bool, str]:
+    def start_job(
+        self,
+        url: str,
+        chunk_duration_sec: int,
+        api_key_1: str = "",
+        api_key_2: str = "",
+        uploaded_audio_path: Optional[str] = None
+    ) -> Tuple[bool, str]:
         """Initiates the background dubbing job in a detached daemon thread."""
         with self.lock:
             if self.worker_thread and self.worker_thread.is_alive():
@@ -500,14 +508,15 @@ class JobManager:
         def mask_key(k: str) -> str:
             return f"{k[:6]}...{k[-4:]}" if len(k) > 10 else ("Configured" if k else "None")
 
-        self.log(f"New job registered (ID: {self.job_id}) for URL: {url}")
+        target_display = os.path.basename(uploaded_audio_path) if uploaded_audio_path else url
+        self.log(f"New job registered (ID: {self.job_id}) for source: {target_display}")
         self.log(f"API Key 1: {mask_key(self.api_key_1)} | API Key 2: {mask_key(self.api_key_2)}")
         self.save_to_disk()
 
         # Start decoupled daemon thread (survives browser disconnects / tab closes)
         self.worker_thread = threading.Thread(
             target=run_pipeline_worker,
-            args=(self, url, chunk_duration_sec, self.api_key_1, self.api_key_2),
+            args=(self, url, chunk_duration_sec, self.api_key_1, self.api_key_2, uploaded_audio_path),
             daemon=True,
             name=f"DubberWorker-{self.job_id}"
         )
@@ -586,9 +595,119 @@ class JobManager:
 job_manager = JobManager()
 
 
-# ─── MEDIA DOWNLOAD (yt-dlp) ──────────────────────────────────────────────────
+# ─── MEDIA DOWNLOAD (yt-dlp & THIRD-PARTY PROXY FALLBACK) ──────────────────────
+def extract_video_id(url: str) -> Optional[str]:
+    """Extracts 11-char YouTube video ID from various URL formats."""
+    patterns = [
+        r'(?:v=|\/)([0-9A-Za-z_-]{11}).*',
+        r'(?:embed\/|v\/|shorts\/)([0-9A-Za-z_-]{11})',
+        r'^([0-9A-Za-z_-]{11})$'
+    ]
+    for pattern in patterns:
+        m = re.search(pattern, url)
+        if m:
+            return m.group(1)
+    return None
+
+
+def download_via_third_party(url: str, output_mp3_path: str, manager: JobManager) -> bool:
+    """Bulletproof fallback third-party downloader trying public Cobalt and Invidious API instances."""
+    video_id = extract_video_id(url)
+    if not video_id:
+        manager.log(f"[ThirdParty] Could not extract video ID from: {url}", level="WARNING")
+        return False
+
+    manager.log(f"[ThirdParty] 🌐 Initiating third-party proxy download fallback for video ID: {video_id}...")
+
+    # 1. Try public Cobalt instances
+    cobalt_instances = [
+        "https://cobalt-api.kwiatekm.tokyo",
+        "https://api.cobalt.tools",
+        "https://co.wuk.sh",
+        "https://cobalt.api.sc",
+    ]
+    for inst in cobalt_instances:
+        if manager.stop_event.is_set():
+            return False
+        try:
+            manager.log(f"[ThirdParty] Querying Cobalt gateway: {inst}")
+            payload = json.dumps({
+                "url": f"https://www.youtube.com/watch?v={video_id}",
+                "downloadMode": "audio",
+                "audioFormat": "mp3"
+            }).encode("utf-8")
+            req = urllib.request.Request(
+                inst if inst.endswith("/") else inst + "/",
+                data=payload,
+                headers={"Accept": "application/json", "Content-Type": "application/json", "User-Agent": "Mozilla/5.0"}
+            )
+            with urllib.request.urlopen(req, timeout=12) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+                stream_url = data.get("url")
+                if stream_url:
+                    manager.log("[ThirdParty] Cobalt stream resolved! Streaming audio file...")
+                    temp_audio = output_mp3_path + ".download"
+                    urllib.request.urlretrieve(stream_url, temp_audio)
+                    # Convert cleanly to MP3
+                    subprocess.run(
+                        ["ffmpeg", "-y", "-i", temp_audio, "-vn", "-ar", "44100", "-ac", "2", "-b:a", "192k", output_mp3_path],
+                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True
+                    )
+                    if os.path.exists(temp_audio):
+                        os.remove(temp_audio)
+                    if os.path.exists(output_mp3_path) and os.path.getsize(output_mp3_path) > 1024:
+                        manager.log("[ThirdParty] ✅ Successfully downloaded and converted audio via Cobalt!")
+                        return True
+        except Exception as e:
+            manager.log(f"[ThirdParty] Cobalt gateway {inst} failed: {e}", level="DEBUG")
+
+    # 2. Try Invidious API instances
+    invidious_instances = [
+        "https://invidious.f5.si",
+        "https://yt.artemislena.eu",
+        "https://invidious.jing.rocks",
+        "https://invidious.nerdvpn.de",
+        "https://inv.nadeko.net",
+    ]
+    for inst in invidious_instances:
+        if manager.stop_event.is_set():
+            return False
+        try:
+            api_endpoint = f"{inst}/api/v1/videos/{video_id}"
+            manager.log(f"[ThirdParty] Querying Invidious gateway: {inst}")
+            req = urllib.request.Request(api_endpoint, headers={"User-Agent": "Mozilla/5.0"})
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+                formats = data.get("adaptiveFormats", [])
+                audio_formats = [f for f in formats if "audio" in f.get("type", "")]
+                if audio_formats:
+                    best_audio = max(audio_formats, key=lambda x: int(x.get("bitrate", 0) or 0))
+                    audio_url = best_audio.get("url")
+                    if audio_url:
+                        if audio_url.startswith("/"):
+                            audio_url = inst + audio_url
+                        manager.log(f"[ThirdParty] Invidious stream resolved ({best_audio.get('type')})! Streaming...")
+                        temp_audio = output_mp3_path + ".download"
+                        req_stream = urllib.request.Request(audio_url, headers={"User-Agent": "Mozilla/5.0"})
+                        with urllib.request.urlopen(req_stream, timeout=45) as stream_resp, open(temp_audio, "wb") as f_out:
+                            shutil.copyfileobj(stream_resp, f_out)
+                        subprocess.run(
+                            ["ffmpeg", "-y", "-i", temp_audio, "-vn", "-ar", "44100", "-ac", "2", "-b:a", "192k", output_mp3_path],
+                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True
+                        )
+                        if os.path.exists(temp_audio):
+                            os.remove(temp_audio)
+                        if os.path.exists(output_mp3_path) and os.path.getsize(output_mp3_path) > 1024:
+                            manager.log("[ThirdParty] ✅ Successfully downloaded and converted audio via Invidious!")
+                            return True
+        except Exception as e:
+            manager.log(f"[ThirdParty] Invidious gateway {inst} failed: {e}", level="DEBUG")
+
+    return False
+
+
 def download_youtube_audio(url: str, output_dir: str, manager: JobManager) -> Tuple[str, float]:
-    """Downloads highest quality audio stream from YouTube via yt-dlp.
+    """Downloads highest quality audio stream from YouTube via yt-dlp with third-party fallbacks.
     
     Streams directly to disk to minimize RAM usage.
     Returns (path_to_audio_file, duration_in_seconds).
@@ -601,6 +720,7 @@ def download_youtube_audio(url: str, output_dir: str, manager: JobManager) -> Tu
     timestamp = int(time.time())
     template_path = os.path.join(output_dir, f"source_audio_{timestamp}.%(ext)s")
     final_output_path = os.path.join(output_dir, f"source_audio_{timestamp}.mp3")
+    duration = 0.0
 
     def yt_hook(d):
         if manager.stop_event.is_set():
@@ -690,8 +810,14 @@ def download_youtube_audio(url: str, output_dir: str, manager: JobManager) -> Tu
         except Exception as fallback_err:
             if manager.stop_event.is_set():
                 raise
-            manager.log(f"[Downloader] yt-dlp fallback error: {fallback_err}", level="ERROR")
-            raise RuntimeError(f"Failed to download audio from YouTube: {fallback_err}")
+            manager.log(f"[Downloader] yt-dlp fallback error: {fallback_err}. Activating Third-Party Downloader API fallback (Cobalt/Invidious)...", level="WARNING")
+            tp_success = download_via_third_party(url, final_output_path, manager)
+            if not tp_success:
+                raise RuntimeError(
+                    f"Failed to download audio from YouTube (yt-dlp: {fallback_err}). "
+                    "YouTube datacenter IP restrictions are active. "
+                    "Please use the '📁 Or Upload MP3 Directly' feature above to dub your video with 100% reliability."
+                )
 
     # Resolve actual output file path
     if not os.path.exists(final_output_path):
@@ -1136,16 +1262,53 @@ def run_pipeline_worker(
     youtube_url: str,
     chunk_duration_sec: int,
     api_key_1: str = "",
-    api_key_2: str = ""
+    api_key_2: str = "",
+    uploaded_audio_path: Optional[str] = None
 ):
     """The master background worker executing the full pipeline sequentially with Storage Cleanup."""
     try:
         manager.log("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
-        manager.log(f"🎬 Starting Auto Dubbing Pipeline for: {youtube_url}")
+        if uploaded_audio_path and os.path.exists(uploaded_audio_path):
+            source_display = os.path.basename(uploaded_audio_path)
+            manager.log(f"🎬 Starting Auto Dubbing Pipeline with Uploaded Audio: {source_display}")
+        else:
+            manager.log(f"🎬 Starting Auto Dubbing Pipeline for: {youtube_url}")
         manager.log("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
 
-        # 1. Download
-        source_audio_path, duration_sec = download_youtube_audio(youtube_url, WORKSPACE_DIR, manager)
+        # 1. Source Audio Ingestion (Direct Upload Fail-Safe or YouTube Downloader)
+        if uploaded_audio_path and os.path.exists(uploaded_audio_path):
+            manager.log(f"[Source] 📁 Direct audio file detected: {os.path.basename(uploaded_audio_path)}")
+            manager.log("[Source] Bypassing YouTube download completely to avoid IP blocks/bot detection!")
+            manager.status = "DOWNLOADING"
+            manager.message = "Preparing and standardizing uploaded audio file..."
+            manager.progress = 5.0
+
+            timestamp = int(time.time())
+            source_audio_path = os.path.join(WORKSPACE_DIR, f"source_audio_{timestamp}.mp3")
+
+            # Normalize to 44.1kHz stereo 192k MP3 via FFmpeg
+            manager.log("[Source] Converting uploaded audio to 44.1kHz stereo MP3 via FFmpeg...")
+            cmd = [
+                "ffmpeg", "-y", "-i", uploaded_audio_path,
+                "-vn", "-ar", "44100", "-ac", "2", "-b:a", "192k",
+                source_audio_path
+            ]
+            res = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            if res.returncode != 0 or not os.path.exists(source_audio_path):
+                shutil.copy2(uploaded_audio_path, source_audio_path)
+
+            try:
+                probe = AudioSegment.from_file(source_audio_path)
+                duration_sec = len(probe) / 1000.0
+                del probe
+                gc.collect()
+            except Exception:
+                duration_sec = 60.0
+
+            manager.log(f"[Source] ✅ Uploaded audio ready! Duration: {duration_sec:.1f}s ({duration_sec / 60:.1f} min)")
+            manager.progress = 10.0
+        else:
+            source_audio_path, duration_sec = download_youtube_audio(youtube_url, WORKSPACE_DIR, manager)
 
         if manager.stop_event.is_set():
             raise KeyboardInterrupt("Job was cancelled by user.")
@@ -1387,7 +1550,13 @@ def get_dashboard_state() -> Tuple[Any, ...]:
 
 
 # ─── STEP 3 REQUIREMENT 3: PROGRESSIVE YIELD (LIVE DOWNLOAD) GENERATOR ─────────
-def progressive_start_pipeline(url: str, chunk_duration: int, api_key_1: str, api_key_2: str):
+def progressive_start_pipeline(
+    url: str,
+    uploaded_audio: Optional[str],
+    chunk_duration: int,
+    api_key_1: str,
+    api_key_2: str
+):
     """Gradio generator yielding live updates.
     
     CRITICAL PROGRESSIVE YIELD BEHAVIOR:
@@ -1396,14 +1565,20 @@ def progressive_start_pipeline(url: str, chunk_duration: int, api_key_1: str, ap
     while subsequent languages continue processing seamlessly.
     """
     url = (url or "").strip()
-    if not url:
+    if not url and not uploaded_audio:
         yield (
-            "<div style='color: #ef4444; padding: 10px;'>⚠️ Please enter a valid YouTube URL.</div>",
+            "<div style='color: #ef4444; padding: 10px;'>⚠️ Please enter a valid YouTube URL or upload an audio file directly.</div>",
             *get_dashboard_state()[1:]
         )
         return
 
-    success, msg = job_manager.start_job(url, int(chunk_duration), api_key_1, api_key_2)
+    success, msg = job_manager.start_job(
+        url=url,
+        chunk_duration_sec=int(chunk_duration),
+        api_key_1=api_key_1,
+        api_key_2=api_key_2,
+        uploaded_audio_path=uploaded_audio
+    )
     if not success:
         yield get_dashboard_state()
         return
@@ -1453,15 +1628,19 @@ with gr.Blocks(theme=gr.themes.Soft(primary_hue="indigo", neutral_hue="slate"), 
             """
         )
 
-    # 1. Inputs: Video URL & Two-Key Configuration
+    # 1. Inputs: Video URL, Direct MP3 Upload & Two-Key Configuration
     with gr.Row():
-        with gr.Column(scale=8):
+        with gr.Column(scale=6):
             url_input = gr.Textbox(
                 label="YouTube Video URL",
                 placeholder="https://www.youtube.com/watch?v=... (2-3 hour anime theory videos supported)",
                 lines=1,
             )
-        with gr.Column(scale=4):
+            audio_upload_input = gr.Audio(
+                type="filepath",
+                label="Or Upload MP3 Directly",
+            )
+        with gr.Column(scale=6):
             chunk_slider = gr.Slider(
                 minimum=60,
                 maximum=180,
@@ -1470,20 +1649,19 @@ with gr.Blocks(theme=gr.themes.Soft(primary_hue="indigo", neutral_hue="slate"), 
                 label="Chunk Size (seconds)",
                 info="Small 60-120s chunks prevent OOM crashes on 16GB CPU RAM",
             )
-
-    with gr.Row():
-        api_key_1_input = gr.Textbox(
-            label="🔑 Gemini API Key 1 (Round-Robin Primary)",
-            placeholder="AIzaSy... (Used for Chunks 1, 3, 5...)",
-            type="password",
-            lines=1,
-        )
-        api_key_2_input = gr.Textbox(
-            label="🔑 Gemini API Key 2 (Round-Robin Secondary)",
-            placeholder="AIzaSy... (Used for Chunks 2, 4, 6...)",
-            type="password",
-            lines=1,
-        )
+            with gr.Row():
+                api_key_1_input = gr.Textbox(
+                    label="🔑 Gemini API Key 1 (Round-Robin Primary)",
+                    placeholder="AIzaSy... (Used for Chunks 1, 3, 5...)",
+                    type="password",
+                    lines=1,
+                )
+                api_key_2_input = gr.Textbox(
+                    label="🔑 Gemini API Key 2 (Round-Robin Secondary)",
+                    placeholder="AIzaSy... (Used for Chunks 2, 4, 6...)",
+                    type="password",
+                    lines=1,
+                )
 
     with gr.Row():
         start_btn = gr.Button("🚀 Start Dubbing Pipeline", variant="primary", scale=3)
@@ -1551,7 +1729,7 @@ with gr.Blocks(theme=gr.themes.Soft(primary_hue="indigo", neutral_hue="slate"), 
     # Progressive Yield Generator triggered on start click
     start_btn.click(
         fn=progressive_start_pipeline,
-        inputs=[url_input, chunk_slider, api_key_1_input, api_key_2_input],
+        inputs=[url_input, audio_upload_input, chunk_slider, api_key_1_input, api_key_2_input],
         outputs=ui_outputs,
     )
 

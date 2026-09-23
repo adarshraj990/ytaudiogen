@@ -17,6 +17,6 @@ pydub>=0.25.1
 onnxruntime>=1.20.1
 numpy
 
-# Hugging Face Hub (Token-free model download)
-huggingface_hub>=0.23.0
+# Hugging Face Hub (<1.0.0 required for Gradio 4.44.1 HfFolder compatibility)
+huggingface_hub>=0.23.0,<1.0.0
 requests

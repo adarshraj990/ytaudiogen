@@ -16,6 +16,47 @@ from pathlib import Path
 # Suppress harmless warnings for cleaner logs
 warnings.filterwarnings("ignore", category=FutureWarning)
 
+# Backward compatibility shim for Gradio 4.x OAuth with modern huggingface_hub
+try:
+    import huggingface_hub
+    if not hasattr(huggingface_hub, "HfFolder"):
+        class _HfFolderShim:
+            path_token = os.path.expanduser("~/.cache/huggingface/token")
+
+            @classmethod
+            def save_token(cls, token: str):
+                try:
+                    os.makedirs(os.path.dirname(cls.path_token), exist_ok=True)
+                    with open(cls.path_token, "w", encoding="utf-8") as f:
+                        f.write(token)
+                except Exception:
+                    pass
+
+            @classmethod
+            def get_token(cls):
+                token = os.environ.get("HF_TOKEN")
+                if token:
+                    return token
+                if os.path.exists(cls.path_token):
+                    try:
+                        with open(cls.path_token, "r", encoding="utf-8") as f:
+                            return f.read().strip()
+                    except Exception:
+                        return None
+                return None
+
+            @classmethod
+            def delete_token(cls):
+                if os.path.exists(cls.path_token):
+                    try:
+                        os.remove(cls.path_token)
+                    except OSError:
+                        pass
+
+        huggingface_hub.HfFolder = _HfFolderShim
+except Exception:
+    pass
+
 import gradio as gr
 import numpy as np
 from pydub import AudioSegment

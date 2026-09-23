@@ -613,13 +613,21 @@ def download_youtube_audio(url: str, output_dir: str, manager: JobManager) -> Tu
                 manager.progress = round(1.0 + (pct * 0.14), 1)
                 manager.message = f"Downloading audio: {pct:.1f}% ({downloaded//1024//1024}MB / {total//1024//1024}MB)"
 
+    cookie_path = "www.youtube.com_cookies.txt"
+    has_cookies = os.path.exists(cookie_path) and os.path.getsize(cookie_path) > 0
+
+    # Modern resilient options with multi-client extractor & universal audio extraction
     ydl_opts = {
-        "format": "bestaudio/best",
+        "format": "ba/b/18/bestaudio/best",
         "outtmpl": template_path,
-        "cookiefile": "www.youtube.com_cookies.txt",
         "quiet": True,
         "no_warnings": True,
         "progress_hooks": [yt_hook],
+        "extractor_args": {
+            "youtube": {
+                "player_client": ["android", "ios", "web", "mweb"]
+            }
+        },
         "postprocessors": [
             {
                 "key": "FFmpegExtractAudio",
@@ -628,16 +636,47 @@ def download_youtube_audio(url: str, output_dir: str, manager: JobManager) -> Tu
             }
         ],
     }
+    if has_cookies:
+        ydl_opts["cookiefile"] = cookie_path
 
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=True)
             duration = float(info.get("duration", 0.0))
-    except Exception as e:
+    except Exception as primary_err:
         if manager.stop_event.is_set():
             raise
-        manager.log(f"[Downloader] yt-dlp extraction error: {e}", level="ERROR")
-        raise RuntimeError(f"Failed to download audio from YouTube: {e}")
+        manager.log(f"[Downloader] Primary strategy encountered: {primary_err}. Attempting Android/iOS direct client fallback...", level="WARNING")
+        
+        # High-resilience Android/iOS fallback (bypasses web SABR/PO Token restrictions)
+        fallback_opts = {
+            "format": "18/ba/b/best",
+            "outtmpl": template_path,
+            "quiet": True,
+            "no_warnings": True,
+            "progress_hooks": [yt_hook],
+            "extractor_args": {
+                "youtube": {
+                    "player_client": ["android", "ios"]
+                }
+            },
+            "postprocessors": [
+                {
+                    "key": "FFmpegExtractAudio",
+                    "preferredcodec": "mp3",
+                    "preferredquality": "192",
+                }
+            ],
+        }
+        try:
+            with yt_dlp.YoutubeDL(fallback_opts) as ydl:
+                info = ydl.extract_info(url, download=True)
+                duration = float(info.get("duration", 0.0))
+        except Exception as fallback_err:
+            if manager.stop_event.is_set():
+                raise
+            manager.log(f"[Downloader] yt-dlp fallback error: {fallback_err}", level="ERROR")
+            raise RuntimeError(f"Failed to download audio from YouTube: {fallback_err}")
 
     # Resolve actual output file path
     if not os.path.exists(final_output_path):

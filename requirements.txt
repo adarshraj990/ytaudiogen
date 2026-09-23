@@ -4,7 +4,7 @@
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 # YouTube Audio Downloader
-yt-dlp>=2024.8.6
+yt-dlp>=2026.8.19
 
 # Google Generative AI SDK (Gemini API)
 google-generativeai>=0.8.3

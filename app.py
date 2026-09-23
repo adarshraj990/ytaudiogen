@@ -75,6 +75,30 @@ except Exception:
     pass
 
 import gradio as gr
+
+# Backward compatibility patch for Gradio 4.44.1 with modern Pydantic boolean schemas
+try:
+    import gradio_client.utils as _gc_utils
+    _orig_js2py = _gc_utils._json_schema_to_python_type
+
+    def _patched_js2py(schema, defs=None):
+        if not isinstance(schema, dict):
+            return "Any"
+        return _orig_js2py(schema, defs)
+
+    _gc_utils._json_schema_to_python_type = _patched_js2py
+
+    _orig_get_type = _gc_utils.get_type
+
+    def _patched_get_type(schema):
+        if not isinstance(schema, dict):
+            return "Any"
+        return _orig_get_type(schema)
+
+    _gc_utils.get_type = _patched_get_type
+except Exception:
+    pass
+
 import numpy as np
 from pydub import AudioSegment
 from pydub.generators import Sine

@@ -19,4 +19,6 @@ numpy
 
 # Hugging Face Hub (<1.0.0 required for Gradio 4.44.1 HfFolder compatibility)
 huggingface_hub>=0.23.0,<1.0.0
+# Pydantic (<2.11.0 required for Gradio 4.44.1 JSON schema parser compatibility)
+pydantic<2.11.0
 requests

@@ -74,6 +74,29 @@ try:
 except Exception:
     pass
 
+# Backward compatibility patch for Gradio 4.44.1 with Starlette 1.0+ TemplateResponse
+try:
+    from starlette.templating import Jinja2Templates
+    _orig_template_response = Jinja2Templates.TemplateResponse
+
+    def _safe_template_response(self, *args, **kwargs):
+        # Gradio 4.44.1 calls: TemplateResponse(name, {"request": request, ...})
+        # Starlette 1.0+ expects: TemplateResponse(request, name, context=...)
+        if len(args) >= 2 and isinstance(args[0], str) and isinstance(args[1], dict):
+            name = args[0]
+            context = args[1]
+            request = context.get("request")
+            if request is not None:
+                try:
+                    return _orig_template_response(self, request, name, context, *args[2:], **kwargs)
+                except TypeError:
+                    pass
+        return _orig_template_response(self, *args, **kwargs)
+
+    Jinja2Templates.TemplateResponse = _safe_template_response
+except Exception:
+    pass
+
 import gradio as gr
 
 # Backward compatibility patch for Gradio 4.44.1 with modern Pydantic boolean schemas

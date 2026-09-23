@@ -1,0 +1,9 @@
+.venv/
+__pycache__/
+*.pyc
+service_account.json
+resume_state.json
+episodes_output/
+.gemini/
+.agents/
+*.log

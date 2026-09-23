@@ -1,16 +1,20 @@
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-#  PINNED REQUIREMENTS — Hugging Face CPU Tier (Python 3.11)
+#  PINNED REQUIREMENTS — Hugging Face Gradio SDK & ZeroGPU (Python 3.11)
 #  YouTube Auto Audio Dubber (English to Hindi)
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 # YouTube Audio Downloader
 yt-dlp>=2024.8.6
 
-# Speech-to-Text Transcriber (CPU Int8)
+# Speech-to-Text Transcriber
 faster-whisper>=1.0.3
 
-# Gemini Dubbing Director
+# Google GenAI SDK (Official New SDK)
+google-genai>=1.0.0
 google-generativeai>=0.8.3
+
+# PyTorch
+torch
 
 # NumPy & ONNX Runtime
 numpy>=2.0.2

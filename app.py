@@ -5,8 +5,26 @@ import time
 import json
 import logging
 import threading
-import shutil
+import warnings
 from typing import List, Dict, Any, Tuple, Optional
+
+# Suppress harmless deprecation warnings for cleaner startup logs
+warnings.filterwarnings("ignore", category=FutureWarning)
+
+# Hugging Face ZeroGPU Integration
+try:
+    import spaces
+    HAS_ZEROGPU = True
+except (ImportError, Exception):
+    HAS_ZEROGPU = False
+    class spaces:
+        @staticmethod
+        def GPU(func=None, duration=60):
+            if func is not None:
+                return func
+            def decorator(fn):
+                return fn
+            return decorator
 
 import numpy as np
 import gradio as gr
@@ -14,9 +32,19 @@ from pydub import AudioSegment
 from pydub.effects import speedup
 import yt_dlp
 from faster_whisper import WhisperModel
-import google.generativeai as genai
 from kokoro_onnx import Kokoro
 from huggingface_hub import hf_hub_download
+
+# Support both new google-genai and legacy google-generativeai
+try:
+    from google import genai
+    from google.genai import types as genai_types
+    HAS_NEW_GENAI = True
+except ImportError:
+    HAS_NEW_GENAI = False
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        import google.generativeai as legacy_genai
 
 # ─── Logging Setup ─────────────────────────────────────────────────────────────
 logging.basicConfig(
@@ -42,12 +70,18 @@ KOKORO_SAMPLE_RATE = 24000
 
 # Multi-Model Fallback Hierarchy for Gemini API
 GEMINI_MODEL_CASCADE = [
-    "gemini-1.5-flash",
     "gemini-2.0-flash",
+    "gemini-1.5-flash",
     "gemini-1.5-flash-8b",
     "gemini-1.5-pro",
-    "gemini-1.0-pro",
 ]
+
+
+# ─── ZeroGPU Startup Registration ──────────────────────────────────────────────
+@spaces.GPU
+def _zerogpu_startup_check():
+    """Satisfies the Hugging Face ZeroGPU startup registration requirement."""
+    return True
 
 
 # ─── Module 1: YouTube Audio Downloader ────────────────────────────────────────
@@ -85,7 +119,6 @@ def extract_youtube_audio(url: str, output_dir: str = OUTPUT_DIR) -> Tuple[str, 
         duration = float(info_dict.get("duration", 0.0))
 
     if not os.path.exists(final_wav_path):
-        # Fallback search if yt-dlp named it slightly differently
         potential_files = [
             f for f in os.listdir(output_dir)
             if f.startswith(f"yt_source_{timestamp}") and f.endswith(".wav")
@@ -108,20 +141,29 @@ _whisper_instances: Dict[str, WhisperModel] = {}
 _whisper_lock = threading.Lock()
 
 def get_whisper_model(model_size: str = "base.en") -> WhisperModel:
-    """Singleton getter for faster-whisper model to prevent reloading weights into memory."""
+    """Singleton getter for faster-whisper model, automatically utilizing GPU if available."""
+    try:
+        import torch
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+    except Exception:
+        device = "cpu"
+    compute_type = "float16" if device == "cuda" else "int8"
+    cache_key = f"{model_size}_{device}"
+
     with _whisper_lock:
-        if model_size not in _whisper_instances:
-            log.info(f"[Whisper] Loading faster-whisper model '{model_size}' on CPU (int8)...")
-            _whisper_instances[model_size] = WhisperModel(
+        if cache_key not in _whisper_instances:
+            log.info(f"[Whisper] Loading faster-whisper model '{model_size}' on {device.upper()} ({compute_type})...")
+            _whisper_instances[cache_key] = WhisperModel(
                 model_size,
-                device="cpu",
-                compute_type="int8",
+                device=device,
+                compute_type=compute_type,
                 cpu_threads=4,
                 download_root=os.path.join(MODEL_CACHE_DIR, "whisper"),
             )
-        return _whisper_instances[model_size]
+        return _whisper_instances[cache_key]
 
 
+@spaces.GPU(duration=120)
 def transcribe_audio_whisper(audio_path: str, model_size: str = "base.en") -> List[Dict[str, Any]]:
     """Transcribes English audio into timestamped segments using faster-whisper."""
     log.info(f"[Whisper] Transcribing {os.path.basename(audio_path)} ...")
@@ -191,8 +233,6 @@ def translate_and_direct_batch(
     if not resolved_key:
         raise ValueError("Missing Gemini API Key. Please provide it in the UI or set GEMINI_API_KEY.")
 
-    genai.configure(api_key=resolved_key)
-
     user_payload = json.dumps(segments, ensure_ascii=False, indent=2)
     prompt = f"{GEMINI_DIRECTOR_SYSTEM_PROMPT}\n\nHere are the transcribed segments to translate:\n{user_payload}"
 
@@ -200,15 +240,28 @@ def translate_and_direct_batch(
     for model_name in GEMINI_MODEL_CASCADE:
         log.info(f"[GeminiDirector] Attempting batch translation using model: '{model_name}' ...")
         try:
-            model = genai.GenerativeModel(
-                model_name=model_name,
-                generation_config={
-                    "temperature": 0.3,
-                    "response_mime_type": "application/json",
-                },
-            )
-            response = model.generate_content(prompt)
-            raw_text = response.text.strip()
+            if HAS_NEW_GENAI:
+                client = genai.Client(api_key=resolved_key)
+                response = client.models.generate_content(
+                    model=model_name,
+                    contents=prompt,
+                    config=genai_types.GenerateContentConfig(
+                        temperature=0.3,
+                        response_mime_type="application/json",
+                    ),
+                )
+                raw_text = response.text.strip()
+            else:
+                legacy_genai.configure(api_key=resolved_key)
+                model = legacy_genai.GenerativeModel(
+                    model_name=model_name,
+                    generation_config={
+                        "temperature": 0.3,
+                        "response_mime_type": "application/json",
+                    },
+                )
+                response = model.generate_content(prompt)
+                raw_text = response.text.strip()
 
             # Clean potential markdown wrapping if present
             clean_json = re.sub(r"^```(?:json)?\s*", "", raw_text, flags=re.MULTILINE)
@@ -217,7 +270,6 @@ def translate_and_direct_batch(
             try:
                 parsed = json.loads(clean_json)
             except json.JSONDecodeError:
-                # Extract first matching array if extra text surrounds the JSON
                 match = re.search(r"\[.*\]", clean_json, flags=re.DOTALL)
                 if match:
                     parsed = json.loads(match.group(0))
@@ -234,7 +286,6 @@ def translate_and_direct_batch(
             error_str = str(exc)
             log.warning(f"[GeminiDirector] Model '{model_name}' failed: {error_str}")
             last_error = exc
-            # If hit rate-limit (429) or model-not-found (404) or server-error (500), cascade to next
             time.sleep(1.0)
             continue
 
@@ -248,11 +299,8 @@ def sanitize_hindi_text(text: str) -> str:
     """Aggressively purges non-Devanagari characters, brackets, and Latin artifacts."""
     if not text:
         return ""
-    # Strip brackets and enclosed text
     text = re.sub(r'\[.*?\]|\(.*?\)|<.*?>|\{.*?\}|【.*?】|〔.*?〕|［.*?］', '', text, flags=re.DOTALL)
-    # Strip Latin letters, numbers, and technical formatting symbols
     text = re.sub(r'[a-zA-Z0-9_:|\-\+\/\*=\\\#\[\]\(\)\{\}]+', '', text)
-    # Normalize whitespace
     return re.sub(r'\s+', ' ', text).strip()
 
 
@@ -397,7 +445,7 @@ def pcm_to_audiosegment(samples: np.ndarray, sample_rate: int = KOKORO_SAMPLE_RA
     arr = np.asarray(samples, dtype=np.float32)
     peak = np.abs(arr).max()
     if peak > 0:
-        arr = (arr / peak) * 0.95  # Headroom normalization to prevent digital clipping
+        arr = (arr / peak) * 0.95
     pcm16 = (arr * 32767).astype(np.int16)
     return AudioSegment(
         pcm16.tobytes(),
@@ -407,6 +455,7 @@ def pcm_to_audiosegment(samples: np.ndarray, sample_rate: int = KOKORO_SAMPLE_RA
     )
 
 
+@spaces.GPU(duration=60)
 def synthesize_hindi_segment(
     text: str,
     voice: str = "hm_omega",
@@ -451,16 +500,13 @@ def fit_audio_to_timeslot(
 
     if ratio <= max_stretch_factor:
         try:
-            # Pydub speedup without major pitch distortion
             adjusted = speedup(audio_seg, playback_speed=ratio)
             return adjusted[:target_duration_ms]
         except Exception:
-            # Fallback frame_rate resample speedup
             new_frame_rate = int(audio_seg.frame_rate * ratio)
             adjusted = audio_seg._spawn(audio_seg.raw_data, overrides={"frame_rate": new_frame_rate})
             return adjusted.set_frame_rate(audio_seg.frame_rate)[:target_duration_ms]
     else:
-        # Overflow exceeds maximum speedup limit: apply max speedup and soft-fade trim
         try:
             adjusted = speedup(audio_seg, playback_speed=max_stretch_factor)
         except Exception:
@@ -468,7 +514,6 @@ def fit_audio_to_timeslot(
             adjusted = audio_seg._spawn(audio_seg.raw_data, overrides={"frame_rate": new_frame_rate})
             adjusted = adjusted.set_frame_rate(audio_seg.frame_rate)
 
-        # Apply a smooth 50ms fade-out on the tail cut to eliminate pop/click artifacts
         fade_len = min(50, target_duration_ms)
         return adjusted[:target_duration_ms].fade_out(fade_len)
 
@@ -530,7 +575,6 @@ def run_auto_dubbing_pipeline(
     if not youtube_url:
         raise gr.Error("Please enter a valid YouTube URL.")
 
-    # Voice map
     voice_name = "hm_omega" if "hm_omega" in voice_choice else "hf_alpha"
 
     try:
@@ -538,7 +582,7 @@ def run_auto_dubbing_pipeline(
         progress(0.05, desc="Step 1/5: Extracting audio from YouTube...")
         raw_audio_path, total_duration = extract_youtube_audio(youtube_url)
 
-        # Step 2: Whisper Transcription
+        # Step 2: Whisper Transcription (ZeroGPU Accelerated)
         progress(0.25, desc=f"Step 2/5: Transcribing English timestamps ({whisper_model_choice})...")
         transcribed_segments = transcribe_audio_whisper(raw_audio_path, model_size=whisper_model_choice)
         if not transcribed_segments:
@@ -609,7 +653,7 @@ with gr.Blocks(theme=gr.themes.Soft(primary_hue="rose", secondary_hue="slate"), 
             """
             # 🎙️ YouTube Auto Audio Dubber (EN ➔ HI)
             ### AI-Powered English to Hindi Video Audio Dubbing with Timestamp Alignment
-            *Powered by **faster-whisper**, **Gemini 1.5 Flash Director**, and **Kokoro-ONNX Hindi TTS***
+            *Powered by **faster-whisper (ZeroGPU)**, **Gemini Flash Director**, and **Kokoro-ONNX Hindi TTS***
             """
         )
 

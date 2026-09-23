@@ -613,19 +613,34 @@ def download_youtube_audio(url: str, output_dir: str, manager: JobManager) -> Tu
                 manager.progress = round(1.0 + (pct * 0.14), 1)
                 manager.message = f"Downloading audio: {pct:.1f}% ({downloaded//1024//1024}MB / {total//1024//1024}MB)"
 
-    cookie_path = "www.youtube.com_cookies.txt"
-    has_cookies = os.path.exists(cookie_path) and os.path.getsize(cookie_path) > 0
+    # Robust cookie resolution across working directory, script directory, and root
+    cookie_candidates = [
+        "www.youtube.com_cookies.txt",
+        os.path.join(os.path.dirname(os.path.abspath(__file__)), "www.youtube.com_cookies.txt"),
+        os.path.join(os.getcwd(), "www.youtube.com_cookies.txt"),
+        "/app/www.youtube.com_cookies.txt",
+    ]
+    resolved_cookie_file = None
+    for cp in cookie_candidates:
+        if os.path.exists(cp) and os.path.getsize(cp) > 0:
+            resolved_cookie_file = os.path.abspath(cp)
+            break
 
-    # Modern resilient options with multi-client extractor & universal audio extraction
+    if resolved_cookie_file:
+        manager.log(f"[Downloader] Using authenticated session cookies: {os.path.basename(resolved_cookie_file)}")
+    else:
+        manager.log("[Downloader] Running direct client mode without cookies")
+
+    # Android client does not trigger web browser bot checks / PO-tokens on datacenter IPs
     ydl_opts = {
-        "format": "ba/b/18/bestaudio/best",
+        "format": "18/ba/b/best",
         "outtmpl": template_path,
         "quiet": True,
         "no_warnings": True,
         "progress_hooks": [yt_hook],
         "extractor_args": {
             "youtube": {
-                "player_client": ["android", "ios", "web", "mweb"]
+                "player_client": ["android"]
             }
         },
         "postprocessors": [
@@ -636,8 +651,8 @@ def download_youtube_audio(url: str, output_dir: str, manager: JobManager) -> Tu
             }
         ],
     }
-    if has_cookies:
-        ydl_opts["cookiefile"] = cookie_path
+    if resolved_cookie_file:
+        ydl_opts["cookiefile"] = resolved_cookie_file
 
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
@@ -646,9 +661,9 @@ def download_youtube_audio(url: str, output_dir: str, manager: JobManager) -> Tu
     except Exception as primary_err:
         if manager.stop_event.is_set():
             raise
-        manager.log(f"[Downloader] Primary strategy encountered: {primary_err}. Attempting Android/iOS direct client fallback...", level="WARNING")
+        manager.log(f"[Downloader] Primary strategy encountered: {primary_err}. Attempting unauthenticated Android client fallback...", level="WARNING")
         
-        # High-resilience Android/iOS fallback (bypasses web SABR/PO Token restrictions)
+        # High-resilience Android fallback without cookies (in case session cookies were rotated/invalidated)
         fallback_opts = {
             "format": "18/ba/b/best",
             "outtmpl": template_path,
@@ -657,7 +672,7 @@ def download_youtube_audio(url: str, output_dir: str, manager: JobManager) -> Tu
             "progress_hooks": [yt_hook],
             "extractor_args": {
                 "youtube": {
-                    "player_client": ["android", "ios"]
+                    "player_client": ["android"]
                 }
             },
             "postprocessors": [

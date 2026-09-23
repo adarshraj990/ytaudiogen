@@ -490,10 +490,22 @@ class JobManager:
             if self.worker_thread and self.worker_thread.is_alive():
                 return False, "A dubbing task is already running in the background. Wait or cancel it first."
 
+            # Fetch Gemini API keys strictly from standard environment variables
+            effective_key_1 = (api_key_1 or "").strip() or os.environ.get("GEMINI_API_KEY_1")
+            effective_key_2 = (api_key_2 or "").strip() or os.environ.get("GEMINI_API_KEY_2")
+
+            if not effective_key_1 and not effective_key_2:
+                err_msg = (
+                    "Gemini API keys are not configured. Both GEMINI_API_KEY_1 and GEMINI_API_KEY_2 are None. "
+                    "Please set secret names exactly as 'GEMINI_API_KEY_1' and 'GEMINI_API_KEY_2' in the host environment."
+                )
+                self.log(f"❌ {err_msg}", level="ERROR")
+                return False, err_msg
+
             self.job_id = uuid.uuid4().hex[:8]
             self.url = url
-            self.api_key_1 = api_key_1.strip()
-            self.api_key_2 = api_key_2.strip()
+            self.api_key_1 = effective_key_1 or ""
+            self.api_key_2 = effective_key_2 or ""
             self.status = "STARTING"
             self.progress = 1.0
             self.message = "Initializing background task..."
@@ -506,8 +518,11 @@ class JobManager:
             self.end_time = None
             self.stop_event.clear()
 
-        def mask_key(k: str) -> str:
-            return f"{k[:6]}...{k[-4:]}" if len(k) > 10 else ("Configured" if k else "None")
+        def mask_key(k: Optional[str]) -> str:
+            if not k:
+                return "None (Missing)"
+            k = k.strip()
+            return f"{k[:6]}...{k[-4:]}" if len(k) > 10 else "Configured"
 
         target_display = os.path.basename(uploaded_audio_path) if uploaded_audio_path else url
         self.log(f"New job registered (ID: {self.job_id}) for source: {target_display}")
@@ -1059,22 +1074,18 @@ def call_gemini_with_4layer_rotation(
     manager: Optional[JobManager] = None,
 ) -> str:
     """Executes a 4-layer API rotation and fallback strategy with zero time.sleep() delays."""
-    keys_pool = [k.strip() for k in [api_key_1, api_key_2] if k and k.strip()]
-    if not keys_pool:
-        env_keys = [
-            os.environ.get("GEMINI_API_KEY_1", "").strip(),
-            os.environ.get("GEMINI_API_KEY_2", "").strip(),
-            os.environ.get("GEMINI_API_KEY", "").strip(),
-        ]
-        keys_pool = [k for k in env_keys if k]
+    key_1 = (api_key_1 or "").strip() or os.environ.get("GEMINI_API_KEY_1")
+    key_2 = (api_key_2 or "").strip() or os.environ.get("GEMINI_API_KEY_2")
+    keys_pool = [k.strip() for k in [key_1, key_2] if k and k.strip()]
 
     if not keys_pool:
+        err_msg = (
+            "Gemini API keys are missing (both GEMINI_API_KEY_1 and GEMINI_API_KEY_2 are None). "
+            "Please configure secret names exactly as 'GEMINI_API_KEY_1' and 'GEMINI_API_KEY_2' in your host environment."
+        )
         if manager:
-            manager.log("[Translation] No Gemini API key provided. Using simulated anime theory translation.", level="WARNING")
-        return json.dumps({
-            "transcribed_text": f"In this anime theory, we analyze how the Uchiha awakened the Mangekyo Sharingan and how the Hokage of Konoha countered their Jutsu using superior Chakra.",
-            "translated_text": f"इस थ्योरी में हम विश्लेषण करते हैं कि कैसे उचिहा ने मांगेक्यो शारिंगन को जाग्रत किया और कैसे कोनोहा के होकागे ने अपने चक्र का उपयोग करके उनके जुत्सु का मुकाबला किया।"
-        })
+            manager.log(f"❌ [Translation] {err_msg}", level="ERROR")
+        raise RuntimeError(err_msg)
 
     # Determine Key Ordering for this specific chunk
     if len(keys_pool) >= 2:
@@ -1359,7 +1370,18 @@ def run_pipeline_worker(
 ):
     """The master background worker executing the full pipeline sequentially with Storage Cleanup."""
     try:
-        manager.log("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+        # Strictly fetch standard environment variable names if not passed
+        api_key_1 = (api_key_1 or "").strip() or os.environ.get("GEMINI_API_KEY_1")
+        api_key_2 = (api_key_2 or "").strip() or os.environ.get("GEMINI_API_KEY_2")
+
+        if not api_key_1 and not api_key_2:
+            err_msg = (
+                "Gemini API keys are missing (both GEMINI_API_KEY_1 and GEMINI_API_KEY_2 are None). "
+                "Please configure secret names exactly as 'GEMINI_API_KEY_1' and 'GEMINI_API_KEY_2' in your host environment."
+            )
+            manager.log(f"❌ {err_msg}", level="ERROR")
+            raise ValueError(err_msg)
+
         if uploaded_audio_path and os.path.exists(uploaded_audio_path):
             source_display = os.path.basename(uploaded_audio_path)
             manager.log(f"🎬 Starting Auto Dubbing Pipeline with Uploaded Audio: {source_display}")
@@ -1681,6 +1703,29 @@ def progressive_start_pipeline(
         )
         return
 
+    # Strictly fetch standard environment variable names if not passed in UI
+    api_key_1 = (api_key_1 or "").strip() or os.environ.get("GEMINI_API_KEY_1")
+    api_key_2 = (api_key_2 or "").strip() or os.environ.get("GEMINI_API_KEY_2")
+
+    # Clear validation check with visible error in UI and logs if keys are still None
+    if not api_key_1 and not api_key_2:
+        error_banner = (
+            "<div style='color: #f87171; background: #2b1216; border: 1px solid #ef4444; border-radius: 8px; padding: 14px 18px; margin: 10px 0;'>"
+            "<h4 style='margin: 0 0 6px 0; color: #ef4444; font-size: 1.05rem;'>❌ Missing Gemini API Keys</h4>"
+            "Both <code>GEMINI_API_KEY_1</code> and <code>GEMINI_API_KEY_2</code> are <b>None</b>.<br/>"
+            "Please configure the secrets in your host environment with the exact names: "
+            "<code style='color: #67e8f9; background: #16202c; padding: 2px 6px; border-radius: 4px;'>GEMINI_API_KEY_1</code> and "
+            "<code style='color: #67e8f9; background: #16202c; padding: 2px 6px; border-radius: 4px;'>GEMINI_API_KEY_2</code> "
+            "(e.g., in Hugging Face Space Settings &rarr; Variables and secrets), or enter them in the key fields above."
+            "</div>"
+        )
+        job_manager.log("❌ ERROR: Both GEMINI_API_KEY_1 and GEMINI_API_KEY_2 are None. Set secret names exactly as 'GEMINI_API_KEY_1' and 'GEMINI_API_KEY_2' in the host environment.", level="ERROR")
+        yield (
+            error_banner,
+            *get_dashboard_state()[1:]
+        )
+        return
+
     success, msg = job_manager.start_job(
         url=url,
         chunk_duration_sec=int(chunk_duration),
@@ -1762,13 +1807,15 @@ with gr.Blocks(theme=gr.themes.Soft(primary_hue="indigo", neutral_hue="slate"), 
             with gr.Row():
                 api_key_1_input = gr.Textbox(
                     label="🔑 Gemini API Key 1 (Round-Robin Primary)",
-                    placeholder="AIzaSy... (Used for Chunks 1, 3, 5...)",
+                    placeholder="AIzaSy... (or set GEMINI_API_KEY_1 in host secrets)",
+                    value=os.environ.get("GEMINI_API_KEY_1", ""),
                     type="password",
                     lines=1,
                 )
                 api_key_2_input = gr.Textbox(
                     label="🔑 Gemini API Key 2 (Round-Robin Secondary)",
-                    placeholder="AIzaSy... (Used for Chunks 2, 4, 6...)",
+                    placeholder="AIzaSy... (or set GEMINI_API_KEY_2 in host secrets)",
+                    value=os.environ.get("GEMINI_API_KEY_2", ""),
                     type="password",
                     lines=1,
                 )

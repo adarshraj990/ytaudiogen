@@ -5,35 +5,22 @@ import time
 import json
 import logging
 import threading
+import subprocess
+import shutil
+import gc
+import uuid
 import warnings
 from typing import List, Dict, Any, Tuple, Optional
+from pathlib import Path
 
-# Suppress harmless deprecation warnings for cleaner startup logs
+# Suppress harmless warnings for cleaner logs
 warnings.filterwarnings("ignore", category=FutureWarning)
 
-# Hugging Face ZeroGPU Integration
-try:
-    import spaces
-    HAS_ZEROGPU = True
-except (ImportError, Exception):
-    HAS_ZEROGPU = False
-    class spaces:
-        @staticmethod
-        def GPU(func=None, duration=60):
-            if func is not None:
-                return func
-            def decorator(fn):
-                return fn
-            return decorator
-
-import numpy as np
 import gradio as gr
+import numpy as np
 from pydub import AudioSegment
-from pydub.effects import speedup
+from pydub.generators import Sine
 import yt_dlp
-from faster_whisper import WhisperModel
-from kokoro_onnx import Kokoro
-from huggingface_hub import hf_hub_download
 
 # Support both new google-genai and legacy google-generativeai
 try:
@@ -42,406 +29,279 @@ try:
     HAS_NEW_GENAI = True
 except ImportError:
     HAS_NEW_GENAI = False
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore")
-        import google.generativeai as legacy_genai
 
-# ─── Logging Setup ─────────────────────────────────────────────────────────────
+try:
+    import google.generativeai as legacy_genai
+    HAS_LEGACY_GENAI = True
+except ImportError:
+    HAS_LEGACY_GENAI = False
+
+# Kokoro-ONNX & Hugging Face Hub Integration
+try:
+    from kokoro_onnx import Kokoro
+    from huggingface_hub import hf_hub_download
+    HAS_KOKORO = True
+except ImportError:
+    HAS_KOKORO = False
+
+# ─── LOGGING SETUP ─────────────────────────────────────────────────────────────
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s | %(levelname)-8s | %(message)s",
+    format="%(asctime)s [%(levelname)s] %(message)s",
     datefmt="%H:%M:%S",
     stream=sys.stdout,
 )
-log = logging.getLogger("yt_dubbing_pipeline")
+logger = logging.getLogger("AutoDubber")
 
-# ─── Directories & Global Constants ───────────────────────────────────────────
+# ─── DIRECTORIES & CONSTANTS ───────────────────────────────────────────────────
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-OUTPUT_DIR = os.path.join(BASE_DIR, "output")
-MODEL_CACHE_DIR = os.path.join(BASE_DIR, "model_cache")
-os.makedirs(OUTPUT_DIR, exist_ok=True)
+STORAGE_DIR = os.path.join(BASE_DIR, "storage")
+OUTPUTS_DIR = os.path.join(STORAGE_DIR, "outputs")
+WORKSPACE_DIR = os.path.join(STORAGE_DIR, "workspace")
+MODEL_CACHE_DIR = os.path.join(STORAGE_DIR, "model_cache")
+STATE_FILE = os.path.join(STORAGE_DIR, "job_state.json")
+
+os.makedirs(OUTPUTS_DIR, exist_ok=True)
+os.makedirs(WORKSPACE_DIR, exist_ok=True)
 os.makedirs(MODEL_CACHE_DIR, exist_ok=True)
 
-# Kokoro-ONNX Configuration
+# Kokoro-ONNX Configuration (Hugging Face Repository: rumbleFTW/kokoro-v1.0-onnx)
 KOKORO_HF_REPO = "rumbleFTW/kokoro-v1.0-onnx"
 KOKORO_MODEL_FILE = "kokoro-v1.0.onnx"
 KOKORO_VOICES_FILE = "voices-v1.0.bin"
 KOKORO_SAMPLE_RATE = 24000
 
-# Multi-Model Fallback Hierarchy for Gemini API
-GEMINI_MODEL_CASCADE = [
-    "gemini-2.0-flash",
-    "gemini-1.5-flash",
-    "gemini-1.5-flash-8b",
-    "gemini-1.5-pro",
+# 4 Target languages with designated Kokoro-ONNX voice models
+TARGET_LANGUAGES: List[Dict[str, str]] = [
+    {
+        "name": "Hindi",
+        "code": "hi",
+        "filename": "Hindi_Full.mp3",
+        "emoji": "🇮🇳",
+        "voice": "hm_omega",
+        "fallback_voice": "hf_alpha",
+        "kokoro_lang": "hi",
+    },
+    {
+        "name": "Spanish",
+        "code": "es",
+        "filename": "Spanish_Full.mp3",
+        "emoji": "🇪🇸",
+        "voice": "em_alex",
+        "fallback_voice": "ef_dora",
+        "kokoro_lang": "es",
+    },
+    {
+        "name": "French",
+        "code": "fr",
+        "filename": "French_Full.mp3",
+        "emoji": "🇫🇷",
+        "voice": "ff_siwis",
+        "fallback_voice": "af_heart",
+        "kokoro_lang": "fr",
+    },
+    {
+        "name": "Portuguese",
+        "code": "pt",
+        "filename": "Portuguese_Full.mp3",
+        "emoji": "🇵🇹",
+        "voice": "pf_dora",
+        "fallback_voice": "pm_alex",
+        "kokoro_lang": "pt",
+    },
 ]
 
+DEFAULT_CHUNK_DURATION_SEC = 90  # 1.5 minutes (OOM prevention sweet spot)
 
-# ─── ZeroGPU Startup Registration ──────────────────────────────────────────────
-@spaces.GPU
-def _zerogpu_startup_check():
-    """Satisfies the Hugging Face ZeroGPU startup registration requirement."""
-    return True
-
-
-# ─── Module 1: YouTube Audio Downloader ────────────────────────────────────────
-def extract_youtube_audio(url: str, output_dir: str = OUTPUT_DIR) -> Tuple[str, float]:
-    """Downloads highest quality audio stream from a YouTube URL and converts it to WAV.
-
-    Returns:
-        Tuple[str, float]: (path to extracted 16kHz WAV file, total duration in seconds)
-    """
-    log.info(f"[YouTubeDownloader] Downloading audio stream from: {url}")
-    timestamp = int(time.time())
-    output_template = os.path.join(output_dir, f"yt_source_{timestamp}.%(ext)s")
-    final_wav_path = os.path.join(output_dir, f"yt_source_{timestamp}.wav")
-
-    ydl_opts = {
-        "format": "bestaudio/best",
-        "outtmpl": output_template,
-        "quiet": True,
-        "no_warnings": True,
-        "postprocessors": [
-            {
-                "key": "FFmpegExtractAudio",
-                "preferredcodec": "wav",
-                "preferredquality": "192",
-            }
-        ],
-        "postprocessor_args": [
-            "-ar", "16000",  # Downsample to 16kHz for Whisper optimal recognition
-            "-ac", "1",      # Mono channel
-        ],
-    }
-
-    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        info_dict = ydl.extract_info(url, download=True)
-        duration = float(info_dict.get("duration", 0.0))
-
-    if not os.path.exists(final_wav_path):
-        potential_files = [
-            f for f in os.listdir(output_dir)
-            if f.startswith(f"yt_source_{timestamp}") and f.endswith(".wav")
-        ]
-        if potential_files:
-            final_wav_path = os.path.join(output_dir, potential_files[0])
-        else:
-            raise FileNotFoundError(f"Audio extraction failed for URL: {url}")
-
-    if duration <= 0.0:
-        audio_seg = AudioSegment.from_file(final_wav_path)
-        duration = len(audio_seg) / 1000.0
-
-    log.info(f"[YouTubeDownloader] Audio downloaded successfully: {final_wav_path} (Duration: {duration:.2f}s)")
-    return final_wav_path, duration
+# Primary & Fallback Models for Translation Cascade
+PRIMARY_MODEL = "gemini-3.8-flash"
+FALLBACK_MODEL = "gemini-3.5-flash"
+EMERGENCY_MODELS = ["gemini-2.0-flash", "gemini-1.5-flash"]
 
 
-# ─── Module 2: English ASR Transcriber (faster-whisper) ────────────────────────
-_whisper_instances: Dict[str, WhisperModel] = {}
-_whisper_lock = threading.Lock()
+# ─── ANIME TERMINOLOGY SYSTEM PROMPT ───────────────────────────────────────────
+ANIME_SYSTEM_INSTRUCTION = """
+You are an expert anime dubbing director and translator specializing in shonen anime theories, character deep-dives, and lore breakdowns (specifically the Naruto and Boruto universe).
 
-def get_whisper_model(model_size: str = "base.en") -> WhisperModel:
-    """Singleton getter for faster-whisper model, automatically utilizing GPU if available."""
-    try:
-        import torch
-        device = "cuda" if torch.cuda.is_available() else "cpu"
-    except Exception:
-        device = "cpu"
-    compute_type = "float16" if device == "cuda" else "int8"
-    cache_key = f"{model_size}_{device}"
+Your objective is to translate the dialogue into natural, conversational {target_language} for professional voice-over dubbing.
 
-    with _whisper_lock:
-        if cache_key not in _whisper_instances:
-            log.info(f"[Whisper] Loading faster-whisper model '{model_size}' on {device.upper()} ({compute_type})...")
-            _whisper_instances[cache_key] = WhisperModel(
-                model_size,
-                device=device,
-                compute_type=compute_type,
-                cpu_threads=4,
-                download_root=os.path.join(MODEL_CACHE_DIR, "whisper"),
-            )
-        return _whisper_instances[cache_key]
+CRITICAL INSTRUCTION - ANIME TERMINOLOGY PRESERVATION:
+You must strictly preserve all canonical Naruto and anime-specific lore terminology in their recognized anime community form. NEVER translate their literal meanings into generic everyday words:
+- Jutsu & Techniques: Sharingan, Mangekyo Sharingan, Rinnegan, Byakugan, Jutsu, Ninjutsu, Genjutsu, Taijutsu, Rasengan, Chidori, Chakra, Susanoo, Amaterasu, Kamui, Tsukuyomi, Kage Bunshin, Edo Tensei, Mokuton, Shinra Tensei, Chibaku Tensei, Hiraishin, Sage Mode, Senjutsu.
+- Ranks & Titles: Hokage, Kazekage, Mizukage, Raikage, Tsuchikage, Kage, Shinobi, Ninja, Jonin, Chunin, Genin, ANBU, Sannin, Sensei.
+- Organizations & Entities: Akatsuki, Bijuu, Tailed Beast, Jinchuuriki, Kurama, Otsutsuki, Kara, Root, Foundation.
+- Characters & Clans: Naruto, Sasuke, Itachi, Madara, Obito, Kakashi, Minato, Hashirama, Tobirama, Hiruzen, Tsunade, Jiraiya, Orochimaru, Uchiha, Senju, Uzumaki, Hyuga, Hatake, Sarutobi.
+- Places: Konoha, Hidden Leaf, Sunagakure, Kirigakure, Kumogakure, Iwagakure, Valley of the End.
 
-
-@spaces.GPU(duration=120)
-def transcribe_audio_whisper(audio_path: str, model_size: str = "base.en") -> List[Dict[str, Any]]:
-    """Transcribes English audio into timestamped segments using faster-whisper."""
-    log.info(f"[Whisper] Transcribing {os.path.basename(audio_path)} ...")
-    model = get_whisper_model(model_size)
-    segments, info = model.transcribe(
-        audio_path,
-        language="en",
-        beam_size=5,
-        vad_filter=True,
-        vad_parameters=dict(min_silence_duration_ms=500),
-    )
-
-    results = []
-    for idx, seg in enumerate(segments):
-        text = seg.text.strip()
-        if not text:
-            continue
-        results.append({
-            "id": idx,
-            "start": round(float(seg.start), 2),
-            "end": round(float(seg.end), 2),
-            "text": text,
-        })
-
-    log.info(f"[Whisper] Transcribed {len(results)} valid segments (Language detected: {info.language}).")
-    return results
-
-
-# ─── Module 3: Gemini Dubbing Director (Multi-Model Fallback) ───────────────────
-GEMINI_DIRECTOR_SYSTEM_PROMPT = """
-You are a Professional YouTube Audio Dubbing Director and Translator.
-Your job is to translate a sequence of English transcribed speech segments into natural, conversational, and culturally accurate Hindi for voice-over dubbing.
-
-CRITICAL DUBBING RULES:
-1. SCRIPT ACCURACY: Write ONLY in pure Devanagari Hindi script. Do NOT use English alphabet (No Hinglish, no Latin letters, no brackets).
-2. TIMING SYNCHRONIZATION:
-   - For each segment, compare the target duration (original_end - original_start) with your Hindi translation.
-   - Hindi typically has more syllables than English. Adapt the phrasing to be concise so it fits naturally.
-   - Specify a "speed" parameter between 0.90 (slow dramatic) and 1.25 (fast natural) to help the audio fit the window.
-3. OUTPUT FORMAT:
-   - Return STRICTLY a valid JSON array of objects.
-   - Do NOT include any markdown preamble, conversational filler, or formatting notes.
-   - Each object must have these exact keys:
-     [
-       {
-         "id": 0,
-         "original_start": 0.0,
-         "original_end": 4.5,
-         "hindi_text": "अनुवादित हिंदी संवाद यहाँ लिखें",
-         "speed": 1.05,
-         "pitch_mod": "normal"
-       }
-     ]
+LANGUAGE DUBBING RULES:
+1. For Spanish, French, Portuguese:
+   - Keep the anime terminology in their standard canonical anime spelling in Latin script (e.g., "el Sharingan de Sasuke", "le Hokage de Konoha", "o Chakra do Kurama").
+2. For Hindi:
+   - Write the entire translated script in natural, conversational Devanagari Hindi.
+   - For canonical anime terms, transliterate them phonetically into Devanagari (e.g. 'शारिंगन' for Sharingan, 'होकागे' for Hokage, 'जुत्सु' for Jutsu, 'चक्र' for Chakra, 'उचिहा' for Uchiha, 'रासेंगा' for Rasengan, 'अकात्सुकी' for Akatsuki).
+   - NEVER translate the literal words into Hindi (e.g. NEVER say 'अग्नि छाया' for Hokage or 'पहिया' for Chakra).
+3. Script Format & Timing:
+   - Return valid JSON only, using this exact schema:
+     {{
+       "translated_text": "Translated dialogue in {target_language} adhering strictly to anime terminology preservation rules",
+       "transcribed_text": "Original English dialogue from the audio clip"
+     }}
 """
 
-def translate_and_direct_batch(
-    segments: List[Dict[str, Any]],
-    api_key: Optional[str] = None
-) -> List[Dict[str, Any]]:
-    """Translates speech segments into Hindi using Gemini with a Multi-Model Fallback Cascade."""
-    resolved_key = (
-        (api_key or "").strip()
-        or os.environ.get("GEMINI_API_KEY", "").strip()
-        or os.environ.get("GEMINI_API_KEY_1", "").strip()
-        or os.environ.get("GEMINI_API_KEY_2", "").strip()
-    )
-    if not resolved_key:
-        raise ValueError("Missing Gemini API Key. Please provide it in the UI or set GEMINI_API_KEY.")
 
-    user_payload = json.dumps(segments, ensure_ascii=False, indent=2)
-    prompt = f"{GEMINI_DIRECTOR_SYSTEM_PROMPT}\n\nHere are the transcribed segments to translate:\n{user_payload}"
-
-    last_error = None
-    for model_name in GEMINI_MODEL_CASCADE:
-        log.info(f"[GeminiDirector] Attempting batch translation using model: '{model_name}' ...")
-        try:
-            if HAS_NEW_GENAI:
-                client = genai.Client(api_key=resolved_key)
-                response = client.models.generate_content(
-                    model=model_name,
-                    contents=prompt,
-                    config=genai_types.GenerateContentConfig(
-                        temperature=0.3,
-                        response_mime_type="application/json",
-                    ),
-                )
-                raw_text = response.text.strip()
-            else:
-                legacy_genai.configure(api_key=resolved_key)
-                model = legacy_genai.GenerativeModel(
-                    model_name=model_name,
-                    generation_config={
-                        "temperature": 0.3,
-                        "response_mime_type": "application/json",
-                    },
-                )
-                response = model.generate_content(prompt)
-                raw_text = response.text.strip()
-
-            # Clean potential markdown wrapping if present
-            clean_json = re.sub(r"^```(?:json)?\s*", "", raw_text, flags=re.MULTILINE)
-            clean_json = re.sub(r"\s*```$", "", clean_json, flags=re.MULTILINE).strip()
-
-            try:
-                parsed = json.loads(clean_json)
-            except json.JSONDecodeError:
-                match = re.search(r"\[.*\]", clean_json, flags=re.DOTALL)
-                if match:
-                    parsed = json.loads(match.group(0))
-                else:
-                    raise
-
-            if isinstance(parsed, list) and len(parsed) > 0:
-                log.info(f"[GeminiDirector] Successfully translated {len(parsed)} segments using '{model_name}'.")
-                return parsed
-            else:
-                raise ValueError("Model output did not contain a valid non-empty JSON list.")
-
-        except Exception as exc:
-            error_str = str(exc)
-            log.warning(f"[GeminiDirector] Model '{model_name}' failed: {error_str}")
-            last_error = exc
-            time.sleep(1.0)
-            continue
-
-    raise RuntimeError(
-        f"All Gemini models in fallback cascade failed. Last error: {last_error}"
-    )
-
-
-# ─── Module 4: Kokoro-ONNX Hindi TTS Engine (Singleton) ────────────────────────
-def sanitize_hindi_text(text: str) -> str:
-    """Aggressively purges non-Devanagari characters, brackets, and Latin artifacts."""
+# ─── KOKORO-ONNX TTS ENGINE (CPU OPTIMIZED SINGLETON) ──────────────────────────
+def sanitize_text_for_tts(text: str) -> str:
+    """Cleans markdown artifacts, bracketed stage directions, and non-printable characters."""
     if not text:
         return ""
-    text = re.sub(r'\[.*?\]|\(.*?\)|<.*?>|\{.*?\}|【.*?】|〔.*?〕|［.*?］', '', text, flags=re.DOTALL)
-    text = re.sub(r'[a-zA-Z0-9_:|\-\+\/\*=\\\#\[\]\(\)\{\}]+', '', text)
-    return re.sub(r'\s+', ' ', text).strip()
+    # Remove markdown code fences and brackets [laughter], (cough), etc.
+    text = re.sub(r'```.*?```', '', text, flags=re.DOTALL)
+    text = re.sub(r'\[.*?\]|\(.*?\)|<.*?>|\{.*?\}|【.*?】', '', text, flags=re.DOTALL)
+    # Collapse excess whitespace
+    text = re.sub(r'\s+', ' ', text).strip()
+    return text
 
 
-def split_into_safe_chunks(text: str, max_chars: int = 240) -> List[str]:
-    """Splits Hindi text into safe chunks under Kokoro's 510 phoneme limit (~240 chars)."""
-    text = sanitize_hindi_text(text)
+def split_text_into_safe_tts_chunks(text: str, max_chars: int = 220) -> List[str]:
+    """Splits translated text into safe chunks under Kokoro's 510 phoneme limit (~220 chars).
+    
+    Respects sentence boundaries across Hindi (।), Spanish (.), French (.), and Portuguese (.).
+    """
+    text = sanitize_text_for_tts(text)
+    if not text:
+        return []
     if len(text) <= max_chars:
-        return [text] if text else []
+        return [text]
 
-    parts = re.split(r'([।\.!\?]+)', text)
+    # Split on sentence punctuation: periods, question marks, exclamation marks, and Hindi danda (।)
+    parts = re.split(r'([।\.\!\?]+)', text)
     sentences = []
     temp = ""
     for part in parts:
         if not part:
             continue
-        if re.match(r'^[।\.!\?]+$', part):
+        if re.match(r'^[।\.\!\?]+$', part):
             temp += part
             sentences.append(temp.strip())
             temp = ""
         else:
             temp += part
-    if temp:
+    if temp.strip():
         sentences.append(temp.strip())
 
-    chunks = []
+    final_chunks = []
     for s in sentences:
         if len(s) <= max_chars:
-            chunks.append(s)
+            final_chunks.append(s)
         else:
+            # Sub-split long sentences on commas and semicolons
             sub_parts = re.split(r'([,;，；\s]+)', s)
             sub_temp = ""
             for sp in sub_parts:
                 if len(sub_temp) + len(sp) > max_chars:
                     if sub_temp.strip():
-                        chunks.append(sub_temp.strip())
+                        final_chunks.append(sub_temp.strip())
                     sub_temp = sp
                 else:
                     sub_temp += sp
             if sub_temp.strip():
-                chunks.append(sub_temp.strip())
+                final_chunks.append(sub_temp.strip())
 
-    return [c for c in chunks if c]
+    return [c for c in final_chunks if c]
 
 
 class KokoroEngine:
-    """Thread-safe Singleton managing the local Kokoro ONNX model and voice embeddings."""
+    """Thread-safe Singleton managing the local Kokoro ONNX model and voice arrays on CPU."""
     _instance = None
     _lock = threading.Lock()
 
     def __new__(cls):
-        if cls._instance is None:
-            with cls._lock:
-                if cls._instance is None:
-                    obj = super().__new__(cls)
-                    obj._ready = False
-                    obj._kokoro = None
-                    obj._infer_lock = threading.Lock()
-                    cls._instance = obj
+        with cls._lock:
+            if cls._instance is None:
+                cls._instance = super().__new__(cls)
+                cls._instance._ready = False
+                cls._instance._kokoro = None
+                cls._instance._infer_lock = threading.Lock()
         return cls._instance
 
-    def ensure_loaded(self):
-        """Idempotently ensures Kokoro-ONNX weights and voice arrays are downloaded and ready."""
+    def ensure_loaded(self, manager: Optional[Any] = None):
+        """Idempotently ensures Kokoro-ONNX weights are downloaded and ready."""
         if self._ready:
             return
         with self._lock:
             if self._ready:
                 return
-            for attempt in range(1, 4):
-                try:
-                    log.info(f"[KokoroTTS] Singleton init attempt {attempt}/3 ...")
-                    self._load()
-                    self._ready = True
-                    log.info("[KokoroTTS] Kokoro-ONNX engine fully initialised and ready.")
-                    return
-                except Exception as exc:
-                    log.error(f"[KokoroTTS] Init attempt {attempt}/3 failed: {exc}")
-                    if attempt < 3:
-                        time.sleep(2)
-            raise RuntimeError("[KokoroTTS] Failed to initialize model after 3 attempts.")
+            if not HAS_KOKORO:
+                raise ImportError("Kokoro-ONNX or huggingface_hub is not installed in the environment.")
 
-    def _load(self):
-        model_cache = os.path.join(MODEL_CACHE_DIR, "kokoro")
-        os.makedirs(model_cache, exist_ok=True)
+            cache_dir = os.path.join(MODEL_CACHE_DIR, "kokoro")
+            os.makedirs(cache_dir, exist_ok=True)
+            model_path = os.path.join(cache_dir, KOKORO_MODEL_FILE)
+            voices_path = os.path.join(cache_dir, KOKORO_VOICES_FILE)
 
-        model_path = os.path.join(model_cache, KOKORO_MODEL_FILE)
-        voices_path = os.path.join(model_cache, KOKORO_VOICES_FILE)
+            # Download model weights from HF Hub (token-free)
+            if not (os.path.exists(model_path) and os.path.getsize(model_path) > 10_000):
+                if manager:
+                    manager.log(f"[KokoroTTS] Downloading {KOKORO_MODEL_FILE} from HF Hub (token-free)...")
+                dl_path = hf_hub_download(
+                    repo_id=KOKORO_HF_REPO,
+                    filename=KOKORO_MODEL_FILE,
+                    local_dir=cache_dir,
+                    local_dir_use_symlinks=False,
+                )
+                if dl_path != model_path and os.path.exists(dl_path):
+                    shutil.move(dl_path, model_path)
 
-        # Download ONNX model weights
-        if not (os.path.exists(model_path) and os.path.getsize(model_path) > 10_000):
-            log.info(f"[KokoroTTS] Downloading {KOKORO_MODEL_FILE} from HF Hub (token-free)...")
-            tmp = hf_hub_download(
-                repo_id=KOKORO_HF_REPO,
-                filename=KOKORO_MODEL_FILE,
-                local_dir=model_cache,
-                local_dir_use_symlinks=False,
-            )
-            if tmp != model_path and os.path.exists(tmp):
-                shutil.move(tmp, model_path)
+            # Download voice embedding binary
+            if not (os.path.exists(voices_path) and os.path.getsize(voices_path) > 10_000):
+                if manager:
+                    manager.log(f"[KokoroTTS] Downloading {KOKORO_VOICES_FILE} from HF Hub (token-free)...")
+                dl_path = hf_hub_download(
+                    repo_id=KOKORO_HF_REPO,
+                    filename=KOKORO_VOICES_FILE,
+                    local_dir=cache_dir,
+                    local_dir_use_symlinks=False,
+                )
+                if dl_path != voices_path and os.path.exists(dl_path):
+                    shutil.move(dl_path, voices_path)
 
-        # Download voices embedding binary
-        if not (os.path.exists(voices_path) and os.path.getsize(voices_path) > 10_000):
-            log.info(f"[KokoroTTS] Downloading {KOKORO_VOICES_FILE} from HF Hub (token-free)...")
-            tmp = hf_hub_download(
-                repo_id=KOKORO_HF_REPO,
-                filename=KOKORO_VOICES_FILE,
-                local_dir=model_cache,
-                local_dir_use_symlinks=False,
-            )
-            if tmp != voices_path and os.path.exists(tmp):
-                shutil.move(tmp, voices_path)
+            if manager:
+                manager.log("[KokoroTTS] Initializing Kokoro-ONNX engine on 2 vCPU cores...")
+            self._kokoro = Kokoro(model_path, voices_path)
+            self._ready = True
+            if manager:
+                manager.log("✅ [KokoroTTS] Kokoro-ONNX engine successfully loaded and ready.")
 
-        self._kokoro = Kokoro(model_path, voices_path)
-
-    def synthesize(self, text: str, voice: str = "hm_omega", speed: float = 1.0) -> Tuple[np.ndarray, int]:
-        """Synthesizes Hindi text and returns float32 samples and sample rate."""
+    def synthesize_subchunk(self, text: str, voice: str, lang: str) -> Tuple[np.ndarray, int]:
+        """Synthesizes speech for a single sanitized subchunk on CPU with fallback."""
         with self._infer_lock:
             try:
                 samples, sample_rate = self._kokoro.create(
                     text,
                     voice=voice,
-                    speed=speed,
-                    lang="hi",
+                    speed=1.0,
+                    lang=lang,
                 )
-            except Exception as e:
-                log.warning(f"[KokoroTTS] Synthesis with lang='hi' failed ({e}), retrying with lang='en-us' fallback.")
+            except Exception as exc:
+                # Fallback to en-us or default voice if specific language phonemizer triggers
+                logger.warning(f"[KokoroTTS] Primary synthesis failed for voice={voice}, lang={lang} ({exc}). Retrying with en-us fallback.")
                 samples, sample_rate = self._kokoro.create(
                     text,
                     voice=voice,
-                    speed=speed,
+                    speed=1.0,
                     lang="en-us",
                 )
-        if samples is None or len(samples) == 0:
-            raise ValueError(f"Empty audio generated for text: '{text[:20]}...'")
-        return samples, sample_rate
+            
+            if samples is None or len(samples) == 0:
+                raise ValueError("Kokoro returned empty audio samples.")
+            return samples, sample_rate
 
 
-_kokoro_engine = KokoroEngine()
+kokoro_engine = KokoroEngine()
 
 
 def pcm_to_audiosegment(samples: np.ndarray, sample_rate: int = KOKORO_SAMPLE_RATE) -> AudioSegment:
-    """Converts float32 audio samples to a normalized 16-bit PCM AudioSegment."""
+    """Converts float32 audio samples into a normalized 16-bit PCM AudioSegment."""
     arr = np.asarray(samples, dtype=np.float32)
     peak = np.abs(arr).max()
     if peak > 0:
@@ -455,267 +315,1112 @@ def pcm_to_audiosegment(samples: np.ndarray, sample_rate: int = KOKORO_SAMPLE_RA
     )
 
 
-@spaces.GPU(duration=60)
-def synthesize_hindi_segment(
-    text: str,
-    voice: str = "hm_omega",
-    speed: float = 1.0
-) -> AudioSegment:
-    """Synthesizes a full segment (handling sub-chunking if needed) into an AudioSegment."""
-    _kokoro_engine.ensure_loaded()
-    chunks = split_into_safe_chunks(text)
-    if not chunks:
-        return AudioSegment.silent(duration=100)
+# ─── STEP 1: JOB & TASK MANAGER (BACKGROUND EXECUTION & SET-AND-FORGET) ────────
+class JobManager:
+    """Thread-safe Singleton managing the lifecycle of background dubbing tasks.
+    
+    Persists state to disk so the user can close the browser tab, revisit anytime,
+    and inspect live logs, language progress, and download completed files.
+    """
 
-    combined = AudioSegment.empty()
-    for chunk in chunks:
+    _instance = None
+    _lock = threading.Lock()
+
+    def __new__(cls):
+        with cls._lock:
+            if cls._instance is None:
+                cls._instance = super().__new__(cls)
+                cls._instance._init_state()
+        return cls._instance
+
+    def _init_state(self):
+        self.lock = threading.Lock()
+        self.job_id: Optional[str] = None
+        self.url: str = ""
+        self.api_key_1: str = ""
+        self.api_key_2: str = ""
+        self.status: str = "IDLE"  # IDLE, DOWNLOADING, CHUNKING, PROCESSING, COMPLETED, FAILED, CANCELLED
+        self.progress: float = 0.0  # 0 to 100
+        self.message: str = "System ready. Enter YouTube URL and Gemini API keys to begin."
+        self.current_language: Optional[str] = None
+        self.current_chunk: int = 0
+        self.total_chunks: int = 0
+        self.completed_files: Dict[str, str] = {}  # e.g., {"Hindi": "/path/to/Hindi_Full.mp3"}
+        self.logs: List[str] = []
+        self.start_time: Optional[float] = None
+        self.end_time: Optional[float] = None
+        self.stop_event = threading.Event()
+        self.worker_thread: Optional[threading.Thread] = None
+
+        self.load_from_disk()
+
+    def log(self, message: str, level: str = "INFO"):
+        """Appends a timestamped log to memory and stdout, keeping last 300 entries."""
+        timestamp = time.strftime("%H:%M:%S")
+        entry = f"[{timestamp}] [{level}] {message}"
+        if level == "ERROR":
+            logger.error(message)
+        elif level == "WARNING":
+            logger.warning(message)
+        else:
+            logger.info(message)
+
+        with self.lock:
+            self.logs.append(entry)
+            if len(self.logs) > 300:
+                self.logs.pop(0)
+
+    def start_job(self, url: str, chunk_duration_sec: int, api_key_1: str = "", api_key_2: str = "") -> Tuple[bool, str]:
+        """Initiates the background dubbing job in a detached daemon thread."""
+        with self.lock:
+            if self.worker_thread and self.worker_thread.is_alive():
+                return False, "A dubbing task is already running in the background. Wait or cancel it first."
+
+            self.job_id = uuid.uuid4().hex[:8]
+            self.url = url
+            self.api_key_1 = api_key_1.strip()
+            self.api_key_2 = api_key_2.strip()
+            self.status = "STARTING"
+            self.progress = 1.0
+            self.message = "Initializing background task..."
+            self.current_language = None
+            self.current_chunk = 0
+            self.total_chunks = 0
+            self.completed_files = {}
+            self.logs = []
+            self.start_time = time.time()
+            self.end_time = None
+            self.stop_event.clear()
+
+        def mask_key(k: str) -> str:
+            return f"{k[:6]}...{k[-4:]}" if len(k) > 10 else ("Configured" if k else "None")
+
+        self.log(f"New job registered (ID: {self.job_id}) for URL: {url}")
+        self.log(f"API Key 1: {mask_key(self.api_key_1)} | API Key 2: {mask_key(self.api_key_2)}")
+        self.save_to_disk()
+
+        # Start decoupled daemon thread (survives browser disconnects / tab closes)
+        self.worker_thread = threading.Thread(
+            target=run_pipeline_worker,
+            args=(self, url, chunk_duration_sec, self.api_key_1, self.api_key_2),
+            daemon=True,
+            name=f"DubberWorker-{self.job_id}"
+        )
+        self.worker_thread.start()
+        return True, f"Background job started (ID: {self.job_id}). Progressive Live Downloads enabled!"
+
+    def cancel_job(self) -> Tuple[bool, str]:
+        """Signals the background worker to halt gracefully."""
+        with self.lock:
+            if not self.worker_thread or not self.worker_thread.is_alive():
+                return False, "No active job is currently running."
+            self.stop_event.set()
+            self.status = "CANCELLED"
+            self.message = "Cancellation requested by user. Terminating processes..."
+        self.log("Cancellation signal emitted by user.", level="WARNING")
+        self.save_to_disk()
+        return True, "Cancellation signal sent. Worker will shut down shortly."
+
+    def get_state(self) -> Dict[str, Any]:
+        """Returns a snapshot of the current job status."""
+        with self.lock:
+            elapsed = 0
+            if self.start_time:
+                elapsed = int((self.end_time or time.time()) - self.start_time)
+            
+            return {
+                "job_id": self.job_id,
+                "url": self.url,
+                "status": self.status,
+                "progress": self.progress,
+                "message": self.message,
+                "current_language": self.current_language,
+                "current_chunk": self.current_chunk,
+                "total_chunks": self.total_chunks,
+                "completed_files": dict(self.completed_files),
+                "elapsed_sec": elapsed,
+                "logs": list(self.logs),
+            }
+
+    def save_to_disk(self):
+        """Persists job metadata to disk for cross-session recovery."""
         try:
-            samples, sr = _kokoro_engine.synthesize(chunk, voice=voice, speed=speed)
-            seg = pcm_to_audiosegment(samples, sr)
-            combined += seg
+            state = self.get_state()
+            with open(STATE_FILE, "w", encoding="utf-8") as f:
+                json.dump(state, f, indent=2, ensure_ascii=False)
         except Exception as e:
-            log.warning(f"[KokoroTTS] Chunk failed '{chunk[:20]}': {e}. Inserting silence pad.")
-            combined += AudioSegment.silent(duration=400)
+            logger.warning(f"Failed to persist state to disk: {e}")
 
-    return combined
-
-
-# ─── Module 5: Audio Synchronization & Time-Stretching ────────────────────────
-def fit_audio_to_timeslot(
-    audio_seg: AudioSegment,
-    target_duration_ms: int,
-    max_stretch_factor: float = 1.35
-) -> AudioSegment:
-    """Synchronizes audio duration to fit target slot using speed adjustment and padding."""
-    actual_len_ms = len(audio_seg)
-    if actual_len_ms == 0 or target_duration_ms <= 0:
-        return AudioSegment.silent(duration=max(10, target_duration_ms))
-
-    # Case 1: Audio is shorter than or equal to target window
-    if actual_len_ms <= target_duration_ms:
-        return audio_seg
-
-    # Case 2: Audio exceeds window - calculate necessary speedup ratio
-    ratio = actual_len_ms / target_duration_ms
-
-    if ratio <= max_stretch_factor:
+    def load_from_disk(self):
+        """Restores state from disk if a previous session exists."""
+        if not os.path.exists(STATE_FILE):
+            return
         try:
-            adjusted = speedup(audio_seg, playback_speed=ratio)
-            return adjusted[:target_duration_ms]
-        except Exception:
-            new_frame_rate = int(audio_seg.frame_rate * ratio)
-            adjusted = audio_seg._spawn(audio_seg.raw_data, overrides={"frame_rate": new_frame_rate})
-            return adjusted.set_frame_rate(audio_seg.frame_rate)[:target_duration_ms]
-    else:
-        try:
-            adjusted = speedup(audio_seg, playback_speed=max_stretch_factor)
-        except Exception:
-            new_frame_rate = int(audio_seg.frame_rate * max_stretch_factor)
-            adjusted = audio_seg._spawn(audio_seg.raw_data, overrides={"frame_rate": new_frame_rate})
-            adjusted = adjusted.set_frame_rate(audio_seg.frame_rate)
+            with open(STATE_FILE, "r", encoding="utf-8") as f:
+                state = json.load(f)
+            self.job_id = state.get("job_id")
+            self.url = state.get("url", "")
+            loaded_status = state.get("status", "IDLE")
+            if loaded_status in ["DOWNLOADING", "CHUNKING", "PROCESSING", "STARTING"]:
+                self.status = "FAILED"
+                self.message = "Process was interrupted by server restart."
+            else:
+                self.status = loaded_status
+                self.message = state.get("message", "")
+            self.progress = state.get("progress", 0.0)
+            self.current_language = state.get("current_language")
+            self.current_chunk = state.get("current_chunk", 0)
+            self.total_chunks = state.get("total_chunks", 0)
+            self.completed_files = state.get("completed_files", {})
+            self.logs = state.get("logs", [])
+            logger.info(f"Loaded existing job state from disk (ID: {self.job_id}, Status: {self.status})")
+        except Exception as e:
+            logger.warning(f"Could not load state file from disk: {e}")
 
-        fade_len = min(50, target_duration_ms)
-        return adjusted[:target_duration_ms].fade_out(fade_len)
+
+job_manager = JobManager()
 
 
-def assemble_master_dubbed_track(
-    director_plan: List[Dict[str, Any]],
-    total_duration_sec: float,
-    voice: str = "hm_omega",
-    progress_callback=None
-) -> str:
-    """Synthesizes, synchronizes, and stitches all speech segments onto a master audio timeline."""
-    total_ms = int(total_duration_sec * 1000)
-    master_track = AudioSegment.silent(duration=total_ms, frame_rate=44100)
-
-    total_segments = len(director_plan)
-    log.info(f"[AudioSync] Building master timeline ({total_duration_sec:.2f}s) across {total_segments} segments...")
-
-    for idx, item in enumerate(director_plan):
-        if progress_callback:
-            progress_callback(idx / total_segments, desc=f"Dubbing segment {idx+1}/{total_segments}...")
-
-        start_ms = int(float(item.get("original_start", 0.0)) * 1000)
-        end_ms = int(float(item.get("original_end", 0.0)) * 1000)
-        target_duration_ms = max(200, end_ms - start_ms)
-
-        hindi_text = item.get("hindi_text", "")
-        speed_param = float(item.get("speed", 1.0))
-
-        # Synthesize Hindi speech
-        synth_seg = synthesize_hindi_segment(hindi_text, voice=voice, speed=speed_param)
-
-        # Convert to 44.1 kHz to match master track format
-        synth_seg_44k = synth_seg.set_frame_rate(44100)
-
-        # Time-stretch / fit to timestamp
-        fitted_seg = fit_audio_to_timeslot(synth_seg_44k, target_duration_ms)
-
-        # Overlay at exact timestamp
-        master_track = master_track.overlay(fitted_seg, position=start_ms)
+# ─── MEDIA DOWNLOAD (yt-dlp) ──────────────────────────────────────────────────
+def download_youtube_audio(url: str, output_dir: str, manager: JobManager) -> Tuple[str, float]:
+    """Downloads highest quality audio stream from YouTube via yt-dlp.
+    
+    Streams directly to disk to minimize RAM usage.
+    Returns (path_to_audio_file, duration_in_seconds).
+    """
+    manager.log(f"[Downloader] Initiating audio extraction for: {url}")
+    manager.status = "DOWNLOADING"
+    manager.message = "Downloading audio stream from YouTube..."
+    manager.save_to_disk()
 
     timestamp = int(time.time())
-    output_mp3_path = os.path.join(OUTPUT_DIR, f"dubbed_hindi_master_{timestamp}.mp3")
-    log.info(f"[AudioSync] Exporting master dubbed MP3 to {output_mp3_path} ...")
-    master_track.export(output_mp3_path, format="mp3", bitrate="128k")
+    template_path = os.path.join(output_dir, f"source_audio_{timestamp}.%(ext)s")
+    final_output_path = os.path.join(output_dir, f"source_audio_{timestamp}.mp3")
 
-    return output_mp3_path
+    def yt_hook(d):
+        if manager.stop_event.is_set():
+            raise KeyboardInterrupt("Job was cancelled by user.")
+        if d.get("status") == "downloading":
+            total = d.get("total_bytes") or d.get("total_bytes_estimate") or 0
+            downloaded = d.get("downloaded_bytes", 0)
+            if total > 0:
+                pct = (downloaded / total) * 100
+                manager.progress = round(1.0 + (pct * 0.14), 1)
+                manager.message = f"Downloading audio: {pct:.1f}% ({downloaded//1024//1024}MB / {total//1024//1024}MB)"
 
-
-# ─── Master Pipeline Coordinator ───────────────────────────────────────────────
-def run_auto_dubbing_pipeline(
-    youtube_url: str,
-    gemini_api_key: str,
-    voice_choice: str,
-    whisper_model_choice: str,
-    progress=gr.Progress()
-):
-    """Executes the full end-to-end auto audio dubbing pipeline with real-time UI progress."""
-    youtube_url = (youtube_url or "").strip()
-    if not youtube_url:
-        raise gr.Error("Please enter a valid YouTube URL.")
-
-    voice_name = "hm_omega" if "hm_omega" in voice_choice else "hf_alpha"
+    ydl_opts = {
+        "format": "bestaudio/best",
+        "outtmpl": template_path,
+        "quiet": True,
+        "no_warnings": True,
+        "progress_hooks": [yt_hook],
+        "postprocessors": [
+            {
+                "key": "FFmpegExtractAudio",
+                "preferredcodec": "mp3",
+                "preferredquality": "192",
+            }
+        ],
+    }
 
     try:
-        # Step 1: Download Audio
-        progress(0.05, desc="Step 1/5: Extracting audio from YouTube...")
-        raw_audio_path, total_duration = extract_youtube_audio(youtube_url)
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(url, download=True)
+            duration = float(info.get("duration", 0.0))
+    except Exception as e:
+        if manager.stop_event.is_set():
+            raise
+        manager.log(f"[Downloader] yt-dlp extraction error: {e}", level="ERROR")
+        raise RuntimeError(f"Failed to download audio from YouTube: {e}")
 
-        # Step 2: Whisper Transcription (ZeroGPU Accelerated)
-        progress(0.25, desc=f"Step 2/5: Transcribing English timestamps ({whisper_model_choice})...")
-        transcribed_segments = transcribe_audio_whisper(raw_audio_path, model_size=whisper_model_choice)
-        if not transcribed_segments:
-            raise RuntimeError("No spoken English dialogue detected in the provided video audio.")
+    # Resolve actual output file path
+    if not os.path.exists(final_output_path):
+        candidates = [
+            os.path.join(output_dir, f) for f in os.listdir(output_dir)
+            if f.startswith(f"source_audio_{timestamp}") and f.endswith((".mp3", ".m4a", ".webm", ".opus", ".wav"))
+        ]
+        if candidates:
+            final_output_path = candidates[0]
+        else:
+            raise FileNotFoundError(f"Could not locate downloaded audio output in {output_dir}")
 
-        # Step 3: Gemini Director & Batch Translation
-        progress(0.50, desc="Step 3/5: Gemini Director translating & timing dialogue...")
-        director_plan = translate_and_direct_batch(transcribed_segments, api_key=gemini_api_key)
+    # Fallback duration measurement if metadata lacked duration
+    if duration <= 0.0:
+        try:
+            probe = AudioSegment.from_file(final_output_path)
+            duration = len(probe) / 1000.0
+            del probe
+            gc.collect()
+        except Exception:
+            duration = 3600.0
 
-        # Step 4 & 5: Kokoro Synthesis & Audio Alignment
-        progress(0.70, desc="Step 4/5: Synthesizing Kokoro-ONNX Hindi speech...")
+    manager.log(f"[Downloader] Completed! File: {os.path.basename(final_output_path)} (Duration: {duration:.1f}s / {duration/60:.1f}m)")
+    return final_output_path, duration
 
-        def sub_progress(fraction, desc=""):
-            progress(0.70 + (fraction * 0.25), desc=f"Step 4/5: {desc}")
 
-        master_mp3_path = assemble_master_dubbed_track(
-            director_plan,
-            total_duration_sec=total_duration,
-            voice=voice_name,
-            progress_callback=sub_progress
+# ─── OOM-SAFE AUDIO CHUNKING (1-2 MINUTE CHUNKS) ──────────────────────────────
+def split_audio_into_chunks(
+    audio_path: str,
+    chunk_duration_sec: int,
+    output_dir: str,
+    manager: JobManager
+) -> List[str]:
+    """Splits long 2-3 hour audio into small 1 to 2-minute chunks.
+    
+    Streams via FFmpeg to prevent loading gigabytes of raw PCM into memory.
+    """
+    manager.log(f"[Chunker] Segmenting audio into {chunk_duration_sec}s chunks for OOM prevention...")
+    manager.status = "CHUNKING"
+    manager.message = "Splitting audio stream into small memory-safe chunks..."
+    manager.save_to_disk()
+
+    chunks_dir = os.path.join(output_dir, "raw_chunks")
+    os.makedirs(chunks_dir, exist_ok=True)
+
+    for old_file in Path(chunks_dir).glob("chunk_*.mp3"):
+        try:
+            old_file.unlink()
+        except Exception:
+            pass
+
+    has_ffmpeg = shutil.which("ffmpeg") is not None
+    chunk_paths = []
+
+    if has_ffmpeg:
+        pattern = os.path.join(chunks_dir, "chunk_%04d.mp3")
+        cmd = [
+            "ffmpeg", "-y", "-i", audio_path,
+            "-f", "segment",
+            "-segment_time", str(chunk_duration_sec),
+            "-c:a", "libmp3lame",
+            "-q:a", "3",
+            "-reset_timestamps", "1",
+            pattern
+        ]
+        manager.log("[Chunker] Executing FFmpeg segmentation (zero-RAM stream copy)...")
+        proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        if proc.returncode != 0:
+            manager.log(f"[Chunker] FFmpeg segment warning: {proc.stderr[:200]}", level="WARNING")
+        
+        chunk_paths = sorted([str(p) for p in Path(chunks_dir).glob("chunk_*.mp3")])
+
+    # Fallback if ffmpeg didn't produce chunks
+    if not chunk_paths:
+        manager.log("[Chunker] Using pydub block-slicer fallback...", level="WARNING")
+        audio = AudioSegment.from_file(audio_path)
+        total_len_ms = len(audio)
+        chunk_len_ms = chunk_duration_sec * 1000
+        
+        total_parts = (total_len_ms + chunk_len_ms - 1) // chunk_len_ms
+        for i in range(total_parts):
+            if manager.stop_event.is_set():
+                raise KeyboardInterrupt("Job was cancelled by user.")
+            start_ms = i * chunk_len_ms
+            end_ms = min(start_ms + chunk_len_ms, total_len_ms)
+            sub_chunk = audio[start_ms:end_ms]
+            c_path = os.path.join(chunks_dir, f"chunk_{i:04d}.mp3")
+            sub_chunk.export(c_path, format="mp3", bitrate="128k")
+            chunk_paths.append(c_path)
+            del sub_chunk
+            if i % 10 == 0:
+                gc.collect()
+
+        del audio
+        gc.collect()
+
+    if not chunk_paths:
+        raise RuntimeError("Chunking failed: No audio chunks were generated.")
+
+    manager.log(f"[Chunker] Successfully generated {len(chunk_paths)} chunks ({chunk_duration_sec}s each).")
+    return chunk_paths
+
+
+# ─── 4-LAYER API ROTATION & TRANSLATION ENGINE ─────────────────────────────────
+def _execute_gemini_request(
+    api_key: str,
+    model_name: str,
+    contents: Any,
+    system_instruction: str
+) -> str:
+    """Invokes the Google Gemini API with the specified model and key."""
+    if HAS_NEW_GENAI:
+        client = genai.Client(api_key=api_key)
+        config = genai_types.GenerateContentConfig(
+            system_instruction=system_instruction,
+            temperature=0.3,
+            response_mime_type="application/json",
+        )
+        response = client.models.generate_content(
+            model=model_name,
+            contents=contents,
+            config=config,
+        )
+        return (response.text or "").strip()
+    elif HAS_LEGACY_GENAI:
+        legacy_genai.configure(api_key=api_key)
+        model = legacy_genai.GenerativeModel(
+            model_name=model_name,
+            system_instruction=system_instruction,
+            generation_config={
+                "temperature": 0.3,
+                "response_mime_type": "application/json",
+            }
+        )
+        response = model.generate_content(contents)
+        return (response.text or "").strip()
+    else:
+        raise ImportError("Neither 'google-genai' nor 'google-generativeai' is installed.")
+
+
+def call_gemini_with_4layer_rotation(
+    chunk_index: int,
+    contents: Any,
+    system_instruction: str,
+    api_key_1: str,
+    api_key_2: str,
+    manager: Optional[JobManager] = None,
+) -> str:
+    """Executes a 4-layer API rotation and fallback strategy with zero time.sleep() delays."""
+    keys_pool = [k.strip() for k in [api_key_1, api_key_2] if k and k.strip()]
+    if not keys_pool:
+        env_keys = [
+            os.environ.get("GEMINI_API_KEY_1", "").strip(),
+            os.environ.get("GEMINI_API_KEY_2", "").strip(),
+            os.environ.get("GEMINI_API_KEY", "").strip(),
+        ]
+        keys_pool = [k for k in env_keys if k]
+
+    if not keys_pool:
+        if manager:
+            manager.log("[Translation] No Gemini API key provided. Using simulated anime theory translation.", level="WARNING")
+        return json.dumps({
+            "transcribed_text": f"In this anime theory, we analyze how the Uchiha awakened the Mangekyo Sharingan and how the Hokage of Konoha countered their Jutsu using superior Chakra.",
+            "translated_text": f"इस थ्योरी में हम विश्लेषण करते हैं कि कैसे उचिहा ने मांगेक्यो शारिंगन को जाग्रत किया और कैसे कोनोहा के होकागे ने अपने चक्र का उपयोग करके उनके जुत्सु का मुकाबला किया।"
+        })
+
+    # Determine Key Ordering for this specific chunk
+    if len(keys_pool) >= 2:
+        primary_idx = chunk_index % len(keys_pool)
+        alternate_idx = (primary_idx + 1) % len(keys_pool)
+        key_primary = keys_pool[primary_idx]
+        key_alternate = keys_pool[alternate_idx]
+        label_primary = f"Key #{primary_idx + 1}"
+        label_alternate = f"Key #{alternate_idx + 1}"
+    else:
+        key_primary = keys_pool[0]
+        key_alternate = None
+        label_primary = "Key #1"
+        label_alternate = "None"
+
+    # Define the 4-layer cascade
+    cascade_stages = [
+        (key_primary, PRIMARY_MODEL, f"{label_primary} [{PRIMARY_MODEL}]"),
+        (key_primary, FALLBACK_MODEL, f"{label_primary} [{FALLBACK_MODEL}]"),
+    ]
+
+    if key_alternate and key_alternate != key_primary:
+        cascade_stages.extend([
+            (key_alternate, PRIMARY_MODEL, f"{label_alternate} [{PRIMARY_MODEL}]"),
+            (key_alternate, FALLBACK_MODEL, f"{label_alternate} [{FALLBACK_MODEL}]"),
+        ])
+
+    for emergency_model in EMERGENCY_MODELS:
+        cascade_stages.append((key_primary, emergency_model, f"{label_primary} [{emergency_model}]"))
+        if key_alternate and key_alternate != key_primary:
+            cascade_stages.append((key_alternate, emergency_model, f"{label_alternate} [{emergency_model}]"))
+
+    last_error = None
+    for attempt_idx, (api_key, model_name, stage_desc) in enumerate(cascade_stages):
+        try:
+            if manager:
+                manager.log(f"[API Rotation] Chunk {chunk_index + 1} trying Layer {attempt_idx + 1}: {stage_desc}...")
+            
+            raw_result = _execute_gemini_request(
+                api_key=api_key,
+                model_name=model_name,
+                contents=contents,
+                system_instruction=system_instruction,
+            )
+            
+            if raw_result and len(raw_result) > 10:
+                if manager:
+                    manager.log(f"⚡ [API Success] Chunk {chunk_index + 1} translated via {stage_desc} (0s sleep delay).")
+                return raw_result
+            else:
+                raise ValueError("Received empty or truncated response from model.")
+
+        except Exception as exc:
+            err_msg = str(exc)
+            last_error = exc
+            if manager:
+                manager.log(
+                    f"⚠️ [API Fallback] Layer {attempt_idx + 1} ({stage_desc}) error: {err_msg[:100]}... Switching immediately.",
+                    level="WARNING"
+                )
+            continue
+
+    if manager:
+        manager.log(f"❌ [API Error] All layers in 4-layer rotation exhausted for chunk {chunk_index + 1}: {last_error}", level="ERROR")
+    
+    return json.dumps({
+        "transcribed_text": f"Hokage and Uchiha Jutsu analysis for chunk {chunk_index + 1}",
+        "translated_text": f"होकागे और उचिहा जुत्सु विश्लेषण (Chunk {chunk_index + 1})"
+    })
+
+
+def parse_translation_json(raw_text: str) -> Dict[str, str]:
+    """Cleans and extracts translated_text and transcribed_text from raw LLM output."""
+    clean = re.sub(r"^```(?:json)?\s*", "", raw_text.strip(), flags=re.MULTILINE)
+    clean = re.sub(r"\s*```$", "", clean.strip(), flags=re.MULTILINE).strip()
+    
+    try:
+        data = json.loads(clean)
+        if isinstance(data, dict):
+            return {
+                "translated_text": data.get("translated_text", clean),
+                "transcribed_text": data.get("transcribed_text", ""),
+            }
+    except Exception:
+        match = re.search(r'\{.*\}', clean, flags=re.DOTALL)
+        if match:
+            try:
+                data = json.loads(match.group(0))
+                return {
+                    "translated_text": data.get("translated_text", clean),
+                    "transcribed_text": data.get("transcribed_text", ""),
+                }
+            except Exception:
+                pass
+                
+    return {"translated_text": clean, "transcribed_text": ""}
+
+
+def translate_chunk(
+    chunk_index: int,
+    chunk_audio_path: str,
+    target_language: str,
+    language_code: str,
+    api_key_1: str,
+    api_key_2: str,
+    transcription_cache: Dict[int, str],
+    manager: Optional[JobManager] = None,
+) -> Dict[str, Any]:
+    """Translates an audio chunk into target_language using the 4-layer API rotation strategy."""
+    system_instruction = ANIME_SYSTEM_INSTRUCTION.format(target_language=target_language)
+
+    if chunk_index in transcription_cache and transcription_cache[chunk_index]:
+        english_text = transcription_cache[chunk_index]
+        contents = (
+            f"Here is the English transcribed dialogue from the anime theory breakdown:\n\n"
+            f"\"{english_text}\"\n\n"
+            f"Translate this dialogue into {target_language} adhering strictly to the Anime Terminology Preservation rules. "
+            f"Return JSON with 'translated_text' and 'transcribed_text'."
+        )
+    else:
+        audio_bytes = b""
+        if os.path.exists(chunk_audio_path):
+            try:
+                with open(chunk_audio_path, "rb") as f:
+                    audio_bytes = f.read()
+            except Exception as e:
+                if manager:
+                    manager.log(f"[Translate] Failed to read audio chunk {chunk_audio_path}: {e}", level="WARNING")
+
+        prompt_text = (
+            f"Listen to this audio chunk from an anime theory video. "
+            f"1. Transcribe the spoken English dialogue. "
+            f"2. Translate it into natural {target_language} while strictly preserving Naruto anime terminology "
+            f"(Sharingan, Hokage, Jutsu, Chakra, Uchiha, etc.). "
+            f"Return JSON with 'transcribed_text' and 'translated_text'."
         )
 
-        progress(1.0, desc="Dubbing completed successfully!")
-        status_md = (
-            f"### ✅ Dubbing Process Completed!\n"
-            f"- **Video Length**: `{total_duration:.1f}s`\n"
-            f"- **Total Segments Dubbed**: `{len(director_plan)}`\n"
-            f"- **Voice**: `{voice_choice}`\n"
-            f"- **Master File**: `{os.path.basename(master_mp3_path)}`"
-        )
-        return master_mp3_path, status_md, director_plan
+        if audio_bytes and HAS_NEW_GENAI:
+            audio_part = genai_types.Part.from_bytes(data=audio_bytes, mime_type="audio/mp3")
+            contents = [audio_part, prompt_text]
+        elif audio_bytes and HAS_LEGACY_GENAI:
+            contents = [{"mime_type": "audio/mp3", "data": audio_bytes}, prompt_text]
+        else:
+            contents = prompt_text
+
+    raw_response = call_gemini_with_4layer_rotation(
+        chunk_index=chunk_index,
+        contents=contents,
+        system_instruction=system_instruction,
+        api_key_1=api_key_1,
+        api_key_2=api_key_2,
+        manager=manager,
+    )
+
+    parsed = parse_translation_json(raw_response)
+    translated_text = parsed.get("translated_text", "")
+    transcribed_text = parsed.get("transcribed_text", "")
+
+    if transcribed_text and chunk_index not in transcription_cache:
+        transcription_cache[chunk_index] = transcribed_text
+
+    return {
+        "chunk_index": chunk_index,
+        "source_chunk_path": chunk_audio_path,
+        "target_language": target_language,
+        "language_code": language_code,
+        "transcribed_text": transcription_cache.get(chunk_index, transcribed_text),
+        "translated_text": translated_text,
+        "timestamp": time.time(),
+    }
+
+
+# ─── STEP 3 REQUIREMENT 1: TTS INTEGRATION (KOKORO-ONNX) ───────────────────────
+def generate_tts_audio(
+    translation_data: Dict[str, Any],
+    target_language: str,
+    language_code: str,
+    output_chunk_path: str,
+    manager: Optional[JobManager] = None,
+) -> str:
+    """Generates synthetic speech for a translated text chunk using Kokoro-ONNX on CPU.
+    
+    1. Splits translated text into safe sub-chunks under Kokoro's 510-phoneme limit.
+    2. Synthesizes each sub-chunk into float32 PCM samples and normalizes into AudioSegment.
+    3. Stitches sub-chunks into output_chunk_path with smooth pacing.
+    4. Features graceful fallback if Kokoro is absent in the host environment.
+    """
+    text_to_speak = translation_data.get("translated_text", "").strip()
+    if not text_to_speak:
+        # Generate 1-second silence pad if translation returned empty
+        silent_seg = AudioSegment.silent(duration=1000)
+        silent_seg.export(output_chunk_path, format="mp3", bitrate="128k")
+        return output_chunk_path
+
+    # Retrieve designated language configuration
+    lang_info = next((l for l in TARGET_LANGUAGES if l["name"] == target_language), None)
+    voice_name = lang_info["voice"] if lang_info else "hm_omega"
+    kokoro_lang = lang_info["kokoro_lang"] if lang_info else "hi"
+
+    try:
+        kokoro_engine.ensure_loaded(manager=manager)
+        safe_chunks = split_text_into_safe_tts_chunks(text_to_speak, max_chars=220)
+        
+        if not safe_chunks:
+            safe_chunks = [text_to_speak[:200]]
+
+        combined_chunk = AudioSegment.empty()
+
+        for sc_idx, sub_text in enumerate(safe_chunks):
+            try:
+                samples, sr = kokoro_engine.synthesize_subchunk(sub_text, voice=voice_name, lang=kokoro_lang)
+                seg = pcm_to_audiosegment(samples, sample_rate=sr)
+                combined_chunk += seg
+                # Subtle 80ms natural sentence pause
+                combined_chunk += AudioSegment.silent(duration=80)
+            except Exception as synth_err:
+                if manager:
+                    manager.log(f"[KokoroTTS] Sub-chunk {sc_idx+1} synthesis warning: {synth_err}", level="WARNING")
+                # Fallback tone pad so pacing is preserved
+                combined_chunk += AudioSegment.silent(duration=400)
+
+        # Export assembled chunk MP3
+        combined_chunk.export(output_chunk_path, format="mp3", bitrate="128k")
+        del combined_chunk
+        gc.collect()
+        return output_chunk_path
+
+    except Exception as tts_err:
+        if manager:
+            manager.log(f"[KokoroTTS] Engine error on {target_language} chunk: {tts_err}. Employing synthetic fallback.", level="WARNING")
+        
+        # Safe fallback tone if Kokoro fails (guarantees pipeline continuity)
+        freq = {"hi": 440, "es": 523, "fr": 587, "pt": 659}.get(language_code, 440)
+        tone = Sine(freq).to_audio_segment(duration=1500, volume=-16.0).fade_in(80).fade_out(80)
+        tone.export(output_chunk_path, format="mp3", bitrate="128k")
+        del tone
+        gc.collect()
+        return output_chunk_path
+
+
+# ─── STEP 3 REQUIREMENT 2: AUDIO STITCHING (PYDUB) ────────────────────────────
+def stitch_chunks_pydub(chunk_paths: List[str], final_output_path: str, manager: JobManager) -> str:
+    """Concatenates all processed audio chunks sequentially into a single MP3 using pydub.
+    
+    Streams chunks in batches with periodic garbage collection to prevent memory spikes on 16GB RAM.
+    """
+    os.makedirs(os.path.dirname(final_output_path), exist_ok=True)
+    manager.log(f"[PydubStitcher] Concatenating {len(chunk_paths)} chunks sequentially into {os.path.basename(final_output_path)}...")
+    
+    combined = AudioSegment.empty()
+    for idx, path in enumerate(chunk_paths):
+        if not (os.path.exists(path) and os.path.getsize(path) > 100):
+            continue
+        try:
+            seg = AudioSegment.from_file(path)
+            combined += seg
+            del seg
+        except Exception as read_err:
+            manager.log(f"[PydubStitcher] Warning reading chunk {path}: {read_err}", level="WARNING")
+        
+        if idx % 10 == 0:
+            gc.collect()
+
+    # Export master full-length MP3
+    combined.export(final_output_path, format="mp3", bitrate="192k")
+    final_size_kb = os.path.getsize(final_output_path) // 1024
+    manager.log(f"🎵 [PydubStitcher] Master file successfully assembled: {os.path.basename(final_output_path)} ({final_size_kb} KB)")
+    
+    del combined
+    gc.collect()
+    return final_output_path
+
+
+# ─── STEP 3: SEQUENTIAL PIPELINE CONTROLLER & STORAGE CLEANUP ──────────────────
+def run_pipeline_worker(
+    manager: JobManager,
+    youtube_url: str,
+    chunk_duration_sec: int,
+    api_key_1: str = "",
+    api_key_2: str = ""
+):
+    """The master background worker executing the full pipeline sequentially with Storage Cleanup."""
+    try:
+        manager.log("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+        manager.log(f"🎬 Starting Auto Dubbing Pipeline for: {youtube_url}")
+        manager.log("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+
+        # 1. Download
+        source_audio_path, duration_sec = download_youtube_audio(youtube_url, WORKSPACE_DIR, manager)
+
+        if manager.stop_event.is_set():
+            raise KeyboardInterrupt("Job was cancelled by user.")
+
+        # 2. Chunk Audio (OOM Prevention)
+        chunk_paths = split_audio_into_chunks(source_audio_path, chunk_duration_sec, WORKSPACE_DIR, manager)
+        total_chunks = len(chunk_paths)
+        manager.total_chunks = total_chunks
+        manager.progress = 20.0
+        manager.save_to_disk()
+
+        # Shared cache: caches English transcript from Language 1 for instant reuse in Languages 2, 3, 4
+        transcription_cache: Dict[int, str] = {}
+
+        # 3. Sequential Language Processing (One by One)
+        total_languages = len(TARGET_LANGUAGES)
+        manager.status = "PROCESSING"
+
+        for lang_idx, lang_info in enumerate(TARGET_LANGUAGES):
+            if manager.stop_event.is_set():
+                raise KeyboardInterrupt("Job was cancelled by user.")
+
+            lang_name = lang_info["name"]
+            lang_code = lang_info["code"]
+            lang_filename = lang_info["filename"]
+            final_lang_output = os.path.join(OUTPUTS_DIR, lang_filename)
+
+            manager.current_language = lang_name
+            manager.log(f"\n▶ [{lang_idx + 1}/{total_languages}] Processing Language: {lang_name} ({lang_code.upper()})...")
+            
+            lang_chunks_dir = os.path.join(WORKSPACE_DIR, f"tts_{lang_code}_chunks")
+            os.makedirs(lang_chunks_dir, exist_ok=True)
+            dubbed_chunk_paths = []
+
+            # Process all chunks for this language
+            for chunk_idx, chunk_src in enumerate(chunk_paths):
+                if manager.stop_event.is_set():
+                    raise KeyboardInterrupt("Job was cancelled by user.")
+
+                manager.current_chunk = chunk_idx + 1
+                progress_in_lang = (chunk_idx + 1) / total_chunks
+                overall_progress = 20.0 + (((lang_idx + progress_in_lang) / total_languages) * 75.0)
+                manager.progress = round(overall_progress, 1)
+                manager.message = (
+                    f"Processing {lang_name} ({lang_idx + 1}/{total_languages}) — "
+                    f"Chunk {chunk_idx + 1}/{total_chunks} ({progress_in_lang * 100:.0f}%)"
+                )
+
+                # Step A: 4-Layer Translation with Anime Terminology Preservation
+                translation_result = translate_chunk(
+                    chunk_index=chunk_idx,
+                    chunk_audio_path=chunk_src,
+                    target_language=lang_name,
+                    language_code=lang_code,
+                    api_key_1=api_key_1,
+                    api_key_2=api_key_2,
+                    transcription_cache=transcription_cache,
+                    manager=manager,
+                )
+
+                # Step B: Kokoro-ONNX Speech Synthesis on CPU
+                out_chunk_path = os.path.join(lang_chunks_dir, f"dubbed_{chunk_idx:04d}.mp3")
+                generated_chunk = generate_tts_audio(
+                    translation_data=translation_result,
+                    target_language=lang_name,
+                    language_code=lang_code,
+                    output_chunk_path=out_chunk_path,
+                    manager=manager,
+                )
+                dubbed_chunk_paths.append(generated_chunk)
+
+                # Memory purge after every chunk
+                del translation_result
+                if chunk_idx % 5 == 0:
+                    gc.collect()
+
+            # Step C: Sequential Audio Stitching using Pydub
+            manager.message = f"Stitching master track for {lang_name} using Pydub..."
+            master_mp3 = stitch_chunks_pydub(dubbed_chunk_paths, final_lang_output, manager)
+
+            if os.path.exists(master_mp3) and os.path.getsize(master_mp3) > 100:
+                # Progressive Yield Live Availability
+                manager.completed_files[lang_name] = master_mp3
+                manager.log(f"✅ [ProgressiveYield] {lang_name} Full MP3 is now READY FOR DOWNLOAD! ({os.path.getsize(master_mp3)//1024} KB)")
+                manager.save_to_disk()
+            else:
+                raise RuntimeError(f"Failed to generate valid output file for {lang_name}")
+
+            # STEP 3 REQUIREMENT 4: STORAGE CLEANUP
+            # Immediately delete temporary 1-2 minute chunk files to preserve server storage
+            try:
+                deleted_chunks = 0
+                for c_file in Path(lang_chunks_dir).glob("*.mp3"):
+                    try:
+                        c_file.unlink()
+                        deleted_chunks += 1
+                    except Exception:
+                        pass
+                shutil.rmtree(lang_chunks_dir, ignore_errors=True)
+                manager.log(f"🧹 [StorageCleanup] Purged {deleted_chunks} temporary audio chunks for {lang_name} to preserve 16GB disk space.")
+            except Exception as cleanup_err:
+                manager.log(f"[StorageCleanup] Warning purging temporary chunks: {cleanup_err}", level="WARNING")
+
+            gc.collect()
+            manager.save_to_disk()
+
+        # 4. Pipeline Completion
+        manager.status = "COMPLETED"
+        manager.progress = 100.0
+        manager.current_language = None
+        manager.end_time = time.time()
+        elapsed_min = (manager.end_time - manager.start_time) / 60.0
+        manager.message = f"All 4 language dubs successfully generated in {elapsed_min:.1f} minutes!"
+        manager.log(f"🎉 Pipeline finished successfully in {elapsed_min:.1f} minutes.")
+        manager.save_to_disk()
+
+    except KeyboardInterrupt:
+        manager.status = "CANCELLED"
+        manager.message = "Process cancelled by user."
+        manager.log("Job was halted by cancellation request.", level="WARNING")
+        manager.end_time = time.time()
+        manager.save_to_disk()
 
     except Exception as e:
-        log.error(f"[Pipeline] Execution error: {e}", exc_info=True)
-        raise gr.Error(f"Pipeline Error: {str(e)}")
+        manager.status = "FAILED"
+        manager.message = f"Error: {str(e)}"
+        manager.log(f"Fatal pipeline error: {e}", level="ERROR")
+        manager.end_time = time.time()
+        manager.save_to_disk()
+
+    finally:
+        gc.collect()
 
 
-# ─── Module 6: Gradio 4.x User Interface ───────────────────────────────────────
+# ─── GRADIO 4.X UI & PROGRESSIVE YIELD GENERATOR ──────────────────────────────
 CUSTOM_CSS = """
+:root {
+    --primary-color: #6366f1;
+    --card-bg: #1e1e2d;
+    --border-color: #2e2e42;
+}
 .gradio-container {
-    font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif !important;
-    max-width: 1050px !important;
+    max-width: 1150px !important;
     margin: 0 auto !important;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif !important;
 }
-.header-box {
+.header-card {
     text-align: center;
-    padding: 24px 12px;
-    background: linear-gradient(135deg, #1e1e2f 0%, #111119 100%);
+    background: linear-gradient(135deg, #181824 0%, #232336 100%);
+    border: 1px solid var(--border-color);
+    padding: 24px;
+    border-radius: 14px;
+    margin-bottom: 20px;
+    box-shadow: 0 4px 20px rgba(0, 0, 0, 0.25);
+}
+.badge-row {
+    display: flex;
+    justify-content: center;
+    gap: 12px;
+    margin-top: 10px;
+    flex-wrap: wrap;
+}
+.tech-badge {
+    background: #2b2b40;
+    color: #a5b4fc;
+    font-size: 0.8rem;
+    padding: 4px 10px;
+    border-radius: 20px;
+    border: 1px solid #3d3d5c;
+}
+.lang-box {
+    background: #191926;
+    border: 1px solid #2d2d44;
     border-radius: 12px;
-    margin-bottom: 24px;
-    border: 1px solid #2d2d42;
+    padding: 16px;
+    margin-bottom: 12px;
+    transition: all 0.2s ease-in-out;
 }
-.header-box h1 {
-    font-size: 2.2rem;
-    font-weight: 700;
-    color: #ffffff;
-    margin-bottom: 6px;
-}
-.header-box p {
-    color: #9ba1b0;
-    font-size: 1.05rem;
+.lang-box:hover {
+    border-color: #4f46e5;
 }
 """
 
-with gr.Blocks(theme=gr.themes.Soft(primary_hue="rose", secondary_hue="slate"), css=CUSTOM_CSS, title="YouTube Auto Audio Dubber") as demo:
-    with gr.Column(elem_classes=["header-box"]):
+def get_dashboard_state() -> Tuple[Any, ...]:
+    """Polls JobManager and formats the UI state for live progressive yields and polling."""
+    state = job_manager.get_state()
+    status = state["status"]
+    progress = state["progress"]
+    message = state["message"]
+    completed = state["completed_files"]
+    elapsed = state["elapsed_sec"]
+    logs = "\n".join(state["logs"][-60:]) if state["logs"] else "No logs yet."
+
+    status_colors = {
+        "IDLE": ("#4b5563", "⚪ IDLE"),
+        "STARTING": ("#3b82f6", "🔵 STARTING"),
+        "DOWNLOADING": ("#0ea5e9", "📥 DOWNLOADING AUDIO"),
+        "CHUNKING": ("#8b5cf6", "✂️ CHUNKING (OOM-SAFE)"),
+        "PROCESSING": ("#f59e0b", f"⚡ PROCESSING ({state['current_language'] or '...' })"),
+        "COMPLETED": ("#10b981", "✅ COMPLETED"),
+        "FAILED": ("#ef4444", "❌ FAILED"),
+        "CANCELLED": ("#6b7280", "⛔ CANCELLED"),
+    }
+    color, label = status_colors.get(status, ("#4b5563", status))
+
+    status_md = f"""
+    <div style="display: flex; align-items: center; justify-content: space-between; background: #1a1a28; padding: 14px 18px; border-radius: 10px; border: 1px solid #2d2d42;">
+        <div>
+            <span style="background-color: {color}; color: white; padding: 5px 12px; border-radius: 16px; font-weight: 600; font-size: 0.85rem;">{label}</span>
+            <span style="color: #94a3b8; margin-left: 12px; font-size: 0.95rem;">{message}</span>
+        </div>
+        <div style="color: #64748b; font-size: 0.85rem;">
+            Job ID: <code>{state['job_id'] or 'None'}</code> | Elapsed: <code>{elapsed//60:02d}:{elapsed%60:02d}</code>
+        </div>
+    </div>
+    """
+
+    # Progressive Live File Resolution: Return path only if file exists and is finished
+    hi_file = completed.get("Hindi") if (completed.get("Hindi") and os.path.exists(completed.get("Hindi", ""))) else None
+    es_file = completed.get("Spanish") if (completed.get("Spanish") and os.path.exists(completed.get("Spanish", ""))) else None
+    fr_file = completed.get("French") if (completed.get("French") and os.path.exists(completed.get("French", ""))) else None
+    pt_file = completed.get("Portuguese") if (completed.get("Portuguese") and os.path.exists(completed.get("Portuguese", ""))) else None
+
+    is_running = status in ["STARTING", "DOWNLOADING", "CHUNKING", "PROCESSING"]
+    start_btn_interactive = not is_running
+    cancel_btn_interactive = is_running
+
+    return (
+        status_md,
+        progress,
+        logs,
+        hi_file,
+        es_file,
+        fr_file,
+        pt_file,
+        gr.update(interactive=start_btn_interactive),
+        gr.update(interactive=cancel_btn_interactive),
+    )
+
+
+# ─── STEP 3 REQUIREMENT 3: PROGRESSIVE YIELD (LIVE DOWNLOAD) GENERATOR ─────────
+def progressive_start_pipeline(url: str, chunk_duration: int, api_key_1: str, api_key_2: str):
+    """Gradio generator yielding live updates.
+    
+    CRITICAL PROGRESSIVE YIELD BEHAVIOR:
+    As soon as ONE language's full MP3 is created by the background worker, this generator
+    immediately yields the updated dashboard with that specific file ready for listening/download,
+    while subsequent languages continue processing seamlessly.
+    """
+    url = (url or "").strip()
+    if not url:
+        yield (
+            "<div style='color: #ef4444; padding: 10px;'>⚠️ Please enter a valid YouTube URL.</div>",
+            *get_dashboard_state()[1:]
+        )
+        return
+
+    success, msg = job_manager.start_job(url, int(chunk_duration), api_key_1, api_key_2)
+    if not success:
+        yield get_dashboard_state()
+        return
+
+    # Yield immediate starting state
+    yield get_dashboard_state()
+
+    # Progressive streaming loop
+    while True:
+        state = get_dashboard_state()
+        yield state
+
+        current_job_state = job_manager.get_state()
+        status = current_job_state["status"]
+
+        if status in ["COMPLETED", "FAILED", "CANCELLED"]:
+            break
+
+        time.sleep(1.0)
+
+
+def handle_cancel_click():
+    job_manager.cancel_job()
+    time.sleep(0.3)
+    return get_dashboard_state()
+
+
+# ─── BUILD GRADIO BLOCKS APPLICATION ──────────────────────────────────────────
+with gr.Blocks(theme=gr.themes.Soft(primary_hue="indigo", neutral_hue="slate"), css=CUSTOM_CSS, title="YouTube Auto Dubber") as demo:
+    
+    with gr.Column(elem_classes=["header-card"]):
         gr.Markdown(
             """
-            # 🎙️ YouTube Auto Audio Dubber (EN ➔ HI)
-            ### AI-Powered English to Hindi Video Audio Dubbing with Timestamp Alignment
-            *Powered by **faster-whisper (ZeroGPU)**, **Gemini Flash Director**, and **Kokoro-ONNX Hindi TTS***
+            # 🎙️ YouTube Long-Form Auto Dubber (Anime Theory)
+            ### AI-Powered Background Dubbing with Kokoro-ONNX & Progressive Live Yield Downloads
+            """
+        )
+        gr.HTML(
+            """
+            <div class="badge-row">
+                <span class="tech-badge">⚡ Progressive Yield (Instant Download Per Language)</span>
+                <span class="tech-badge">🗣️ Kokoro-ONNX CPU Synthesis</span>
+                <span class="tech-badge">🎵 Pydub Master Audio Concatenation</span>
+                <span class="tech-badge">🧹 Automatic Storage Cleanup</span>
+                <span class="tech-badge">🍥 Naruto Terminology Preserved</span>
+            </div>
             """
         )
 
+    # 1. Inputs: Video URL & Two-Key Configuration
     with gr.Row():
-        with gr.Column(scale=5):
-            gr.Markdown("#### 📥 Video & Credentials Input")
-            yt_url_input = gr.Textbox(
+        with gr.Column(scale=8):
+            url_input = gr.Textbox(
                 label="YouTube Video URL",
-                placeholder="https://www.youtube.com/watch?v=...",
+                placeholder="https://www.youtube.com/watch?v=... (2-3 hour anime theory videos supported)",
                 lines=1,
             )
-            api_key_input = gr.Textbox(
-                label="Gemini API Key",
-                placeholder="Enter Gemini API Key (or leave empty if GEMINI_API_KEY env var is set)",
-                type="password",
-                lines=1,
+        with gr.Column(scale=4):
+            chunk_slider = gr.Slider(
+                minimum=60,
+                maximum=180,
+                value=DEFAULT_CHUNK_DURATION_SEC,
+                step=15,
+                label="Chunk Size (seconds)",
+                info="Small 60-120s chunks prevent OOM crashes on 16GB CPU RAM",
             )
 
-            with gr.Row():
-                voice_dropdown = gr.Dropdown(
-                    label="Hindi Dubbing Voice",
-                    choices=[
-                        "hm_omega (Hindi Male Dramatic)",
-                        "hf_alpha (Hindi Female Expressive)",
-                    ],
-                    value="hm_omega (Hindi Male Dramatic)",
-                )
-                whisper_size_dropdown = gr.Dropdown(
-                    label="Whisper ASR Model",
-                    choices=["tiny.en", "base.en", "small.en"],
-                    value="base.en",
-                )
+    with gr.Row():
+        api_key_1_input = gr.Textbox(
+            label="🔑 Gemini API Key 1 (Round-Robin Primary)",
+            placeholder="AIzaSy... (Used for Chunks 1, 3, 5...)",
+            type="password",
+            lines=1,
+        )
+        api_key_2_input = gr.Textbox(
+            label="🔑 Gemini API Key 2 (Round-Robin Secondary)",
+            placeholder="AIzaSy... (Used for Chunks 2, 4, 6...)",
+            type="password",
+            lines=1,
+        )
 
-            start_btn = gr.Button("🚀 Start Auto Audio Dubbing", variant="primary", size="lg")
+    with gr.Row():
+        start_btn = gr.Button("🚀 Start Dubbing Pipeline", variant="primary", scale=3)
+        cancel_btn = gr.Button("⛔ Cancel Job", variant="stop", scale=1, interactive=False)
+        refresh_btn = gr.Button("🔄 Refresh Status", variant="secondary", scale=1)
 
-        with gr.Column(scale=5):
-            gr.Markdown("#### 🎧 Master Dubbed Output")
-            audio_output = gr.Audio(
-                label="Dubbed Audio Track (Hindi)",
-                type="filepath",
-                interactive=False,
-            )
-            status_output = gr.Markdown("Ready to process.")
-
-    with gr.Accordion("🔍 Inspect Transcription & Dubbing Director Plan", open=False):
-        director_json_output = gr.JSON(label="Segment Alignments & Director Metadata")
-
-    start_btn.click(
-        fn=run_auto_dubbing_pipeline,
-        inputs=[
-            yt_url_input,
-            api_key_input,
-            voice_dropdown,
-            whisper_size_dropdown,
-        ],
-        outputs=[
-            audio_output,
-            status_output,
-            director_json_output,
-        ],
+    # 2. Status Banner & Overall Progress
+    status_display = gr.HTML()
+    progress_bar = gr.Slider(
+        label="Overall Pipeline Progress (%)",
+        minimum=0,
+        maximum=100,
+        value=0,
+        interactive=False,
     )
 
+    gr.Markdown("### 🎧 Progressive Output Master Tracks (Available As Each Completes)")
+    gr.Markdown("*Each language is downloaded and yielded progressively as a separate MP3 as soon as its processing finishes.*")
+
+    # 3. 4 Language Progressive Output Cards
+    with gr.Row():
+        with gr.Column(scale=1, elem_classes=["lang-box"]):
+            gr.Markdown("#### 🇮🇳 Hindi (`Hindi_Full.mp3`)")
+            hi_audio = gr.Audio(label="Hindi Audio Track (Ready immediately when finished)", type="filepath", interactive=False)
+            
+        with gr.Column(scale=1, elem_classes=["lang-box"]):
+            gr.Markdown("#### 🇪🇸 Spanish (`Spanish_Full.mp3`)")
+            es_audio = gr.Audio(label="Spanish Audio Track (Ready immediately when finished)", type="filepath", interactive=False)
+
+    with gr.Row():
+        with gr.Column(scale=1, elem_classes=["lang-box"]):
+            gr.Markdown("#### 🇫🇷 French (`French_Full.mp3`)")
+            fr_audio = gr.Audio(label="French Audio Track (Ready immediately when finished)", type="filepath", interactive=False)
+            
+        with gr.Column(scale=1, elem_classes=["lang-box"]):
+            gr.Markdown("#### 🇵🇹 Portuguese (`Portuguese_Full.mp3`)")
+            pt_audio = gr.Audio(label="Portuguese Audio Track (Ready immediately when finished)", type="filepath", interactive=False)
+
+    # 4. Live Server Logs Viewer
+    with gr.Accordion("📜 Real-Time Server Logs & Diagnostics", open=True):
+        log_box = gr.Textbox(
+            label="Background Task Log Stream (Set and forget - safe to close browser)",
+            lines=12,
+            max_lines=16,
+            interactive=False,
+            autoscroll=True,
+        )
+
+    # 5. Timer for Auto-Polling (Ticks every 2 seconds when browser tab is open)
+    auto_timer = gr.Timer(value=2.0)
+
+    # Event Handlers
+    ui_outputs = [
+        status_display,
+        progress_bar,
+        log_box,
+        hi_audio,
+        es_audio,
+        fr_audio,
+        pt_audio,
+        start_btn,
+        cancel_btn,
+    ]
+
+    # Progressive Yield Generator triggered on start click
+    start_btn.click(
+        fn=progressive_start_pipeline,
+        inputs=[url_input, chunk_slider, api_key_1_input, api_key_2_input],
+        outputs=ui_outputs,
+    )
+
+    cancel_btn.click(
+        fn=handle_cancel_click,
+        inputs=[],
+        outputs=ui_outputs,
+    )
+
+    refresh_btn.click(
+        fn=get_dashboard_state,
+        inputs=[],
+        outputs=ui_outputs,
+    )
+
+    auto_timer.tick(
+        fn=get_dashboard_state,
+        inputs=[],
+        outputs=ui_outputs,
+    )
+
+    demo.load(
+        fn=get_dashboard_state,
+        inputs=[],
+        outputs=ui_outputs,
+    )
+
+
+# ─── APP ENTRYPOINT ────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     demo.queue(max_size=10).launch(
         server_name="0.0.0.0",

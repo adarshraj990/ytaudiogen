@@ -7,3 +7,6 @@ episodes_output/
 .gemini/
 .agents/
 *.log
+storage/
+output/
+model_cache/

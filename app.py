@@ -127,7 +127,6 @@ except Exception:
 import numpy as np
 from pydub import AudioSegment
 from pydub.generators import Sine
-import yt_dlp
 
 # Support both new google-genai and legacy google-generativeai
 try:
@@ -443,13 +442,12 @@ class JobManager:
     def _init_state(self):
         self.lock = threading.Lock()
         self.job_id: Optional[str] = None
-        self.url: str = ""
+        self.source_filename: str = ""
         self.api_key_1: str = ""
         self.api_key_2: str = ""
-        self.proxy_url: str = ""
-        self.status: str = "IDLE"  # IDLE, DOWNLOADING, CHUNKING, PROCESSING, COMPLETED, FAILED, CANCELLED
+        self.status: str = "IDLE"  # IDLE, INGESTING, CHUNKING, PROCESSING, COMPLETED, FAILED, CANCELLED
         self.progress: float = 0.0  # 0 to 100
-        self.message: str = "System ready. Enter YouTube URL and Gemini API keys to begin."
+        self.message: str = "System ready. Upload an audio or video file to begin dubbing."
         self.current_language: Optional[str] = None
         self.current_chunk: int = 0
         self.total_chunks: int = 0
@@ -480,17 +478,20 @@ class JobManager:
 
     def start_job(
         self,
-        url: str,
+        uploaded_audio_path: str,
         chunk_duration_sec: int,
         api_key_1: str = "",
-        api_key_2: str = "",
-        uploaded_audio_path: Optional[str] = None,
-        proxy_url: str = ""
+        api_key_2: str = ""
     ) -> Tuple[bool, str]:
         """Initiates the background dubbing job in a detached daemon thread."""
         with self.lock:
             if self.worker_thread and self.worker_thread.is_alive():
                 return False, "A dubbing task is already running in the background. Wait or cancel it first."
+
+            if not uploaded_audio_path or not os.path.exists(uploaded_audio_path):
+                err_msg = "Please upload an audio or video file first."
+                self.log(f"❌ {err_msg}", level="ERROR")
+                return False, err_msg
 
             # Fetch Gemini API keys strictly from standard environment variables
             effective_key_1 = (api_key_1 or "").strip() or os.environ.get("GEMINI_API_KEY_1")
@@ -505,13 +506,12 @@ class JobManager:
                 return False, err_msg
 
             self.job_id = uuid.uuid4().hex[:8]
-            self.url = url
+            self.source_filename = os.path.basename(uploaded_audio_path)
             self.api_key_1 = effective_key_1 or ""
             self.api_key_2 = effective_key_2 or ""
-            self.proxy_url = (proxy_url or "").strip()
             self.status = "STARTING"
             self.progress = 1.0
-            self.message = "Initializing background task..."
+            self.message = f"Initializing pipeline for: {self.source_filename}..."
             self.current_language = None
             self.current_chunk = 0
             self.total_chunks = 0
@@ -527,17 +527,14 @@ class JobManager:
             k = k.strip()
             return f"{k[:6]}...{k[-4:]}" if len(k) > 10 else "Configured"
 
-        target_display = os.path.basename(uploaded_audio_path) if uploaded_audio_path else url
-        self.log(f"New job registered (ID: {self.job_id}) for source: {target_display}")
+        self.log(f"New dubbing job registered (ID: {self.job_id}) for file: {self.source_filename}")
         self.log(f"API Key 1: {mask_key(self.api_key_1)} | API Key 2: {mask_key(self.api_key_2)}")
-        if self.proxy_url:
-            self.log(f"Proxy configured: {self.proxy_url.split('@')[-1]}")
         self.save_to_disk()
 
         # Start decoupled daemon thread (survives browser disconnects / tab closes)
         self.worker_thread = threading.Thread(
             target=run_pipeline_worker,
-            args=(self, url, chunk_duration_sec, self.api_key_1, self.api_key_2, uploaded_audio_path, self.proxy_url),
+            args=(self, uploaded_audio_path, chunk_duration_sec, self.api_key_1, self.api_key_2),
             daemon=True,
             name=f"DubberWorker-{self.job_id}"
         )
@@ -565,7 +562,7 @@ class JobManager:
             
             return {
                 "job_id": self.job_id,
-                "url": self.url,
+                "source_filename": self.source_filename,
                 "status": self.status,
                 "progress": self.progress,
                 "message": self.message,
@@ -594,9 +591,9 @@ class JobManager:
             with open(STATE_FILE, "r", encoding="utf-8") as f:
                 state = json.load(f)
             self.job_id = state.get("job_id")
-            self.url = state.get("url", "")
+            self.source_filename = state.get("source_filename", "")
             loaded_status = state.get("status", "IDLE")
-            if loaded_status in ["DOWNLOADING", "CHUNKING", "PROCESSING", "STARTING"]:
+            if loaded_status in ["INGESTING", "CHUNKING", "PROCESSING", "STARTING"]:
                 self.status = "FAILED"
                 self.message = "Process was interrupted by server restart."
             else:
@@ -616,542 +613,64 @@ class JobManager:
 job_manager = JobManager()
 
 
-# ─── MEDIA DOWNLOAD (4-LAYER WATERFALL ARCHITECTURE) ──────────────────────────
-def extract_video_id(url: str) -> Optional[str]:
-    """Extracts 11-char YouTube video ID from various URL formats."""
-    patterns = [
-        r'(?:v=|\/)([0-9A-Za-z_-]{11}).*',
-        r'(?:embed\/|v\/|shorts\/)([0-9A-Za-z_-]{11})',
-        r'^([0-9A-Za-z_-]{11})$'
-    ]
-    for pattern in patterns:
-        m = re.search(pattern, url)
-        if m:
-            return m.group(1)
-    return None
-
-
-def is_direct_or_gdrive_url(url: str) -> bool:
-    """Checks if the URL is a Google Drive link or direct audio file."""
-    if "drive.google.com" in url:
-        return True
-    exts = (".mp3", ".wav", ".m4a", ".aac", ".ogg", ".opus", ".flac")
-    clean = url.split("?")[0].lower()
-    return any(clean.endswith(ext) for ext in exts)
-
-
-def transcode_to_standard_mp3(input_file: str, output_mp3: str):
-    """Converts any media file into standardized 44.1kHz stereo 192kbps MP3 via FFmpeg."""
-    subprocess.run(
-        [
-            "ffmpeg", "-y", "-i", input_file,
-            "-vn", "-ar", "44100", "-ac", "2", "-b:a", "192k",
-            output_mp3
-        ],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-        check=True
-    )
-
-
-def download_direct_or_gdrive_audio(url: str, output_path: str, manager: JobManager) -> float:
-    """Handles direct audio URLs and public Google Drive download links."""
-    manager.log(f"[Direct Audio] Detected non-YouTube direct/Google Drive URL: {url}")
-    manager.status = "DOWNLOADING"
-    manager.message = "Downloading audio from direct link / Google Drive..."
-    manager.progress = 5.0
-
-    target_url = url
-    if "drive.google.com" in url:
-        m = re.search(r'drive\.google\.com/(?:file/d/|open\?id=|uc\?(?:export=download&)?id=)([a-zA-Z0-9_-]+)', url)
-        if m:
-            file_id = m.group(1)
-            target_url = f"https://drive.google.com/uc?export=download&id={file_id}"
-            manager.log(f"[Google Drive] Converted to direct export URL for file ID: {file_id}")
-
-    temp_path = output_path + ".direct.tmp"
-    req = urllib.request.Request(
-        target_url,
-        headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
-    )
-    ctx = ssl._create_unverified_context()
-    with urllib.request.urlopen(req, timeout=60, context=ctx) as resp, open(temp_path, "wb") as f_out:
-        shutil.copyfileobj(resp, f_out)
-
-    # Transcode to 44.1kHz stereo 192k MP3
-    transcode_to_standard_mp3(temp_path, output_path)
-    if os.path.exists(temp_path):
-        try:
-            os.remove(temp_path)
-        except Exception:
-            pass
-
-    probe = AudioSegment.from_file(output_path)
-    dur = len(probe) / 1000.0
-    del probe
-    gc.collect()
-    manager.log(f"[Direct Audio] Download and transcoding complete! Duration: {dur:.1f}s")
-    return dur
-
-
-def resolve_effective_proxy(custom_proxy: Optional[str] = None) -> Optional[str]:
-    """Resolves proxy configuration from UI input or host environment secrets."""
-    if custom_proxy and custom_proxy.strip():
-        return custom_proxy.strip()
-    env_keys = ["YTDL_PROXY", "PROXY_URL", "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY"]
-    for k in env_keys:
-        val = os.environ.get(k)
-        if val and val.strip():
-            return val.strip()
-    return None
-
-
-def resolve_cookies_file() -> Optional[str]:
-    """Locates any valid YouTube Netscape cookies file in workspace or secrets."""
-    env_cookie = os.environ.get("YTDL_COOKIES_PATH")
-    if env_cookie and os.path.exists(env_cookie) and os.path.getsize(env_cookie) > 0:
-        return os.path.abspath(env_cookie)
-    cookie_candidates = [
-        "www.youtube.com_cookies.txt",
-        "cookies.txt",
-        os.path.join(BASE_DIR, "www.youtube.com_cookies.txt"),
-        os.path.join(BASE_DIR, "cookies.txt"),
-        os.path.join(os.getcwd(), "www.youtube.com_cookies.txt"),
-        os.path.join(os.getcwd(), "cookies.txt"),
-        "/app/www.youtube.com_cookies.txt",
-        "/app/cookies.txt",
-    ]
-    return next((os.path.abspath(cp) for cp in cookie_candidates if os.path.exists(cp) and os.path.getsize(cp) > 0), None)
-
-
-# ─── LAYER 1 (FAST & LIGHT): COBALT API ─────────────────────────────────────────
-def download_layer1_cobalt(url: str, output_path: str, manager: JobManager) -> float:
-    """Layer 1: Lightweight Cobalt API request (bypasses YouTube datacenter blocks)."""
-    video_id = extract_video_id(url) or url
-    clean_url = f"https://www.youtube.com/watch?v={video_id}" if len(video_id) == 11 else url
-
-    instances = [
-        "https://api.cobalt.tools",
-        "https://api.cobalt.tools/api/json",
-        "https://cobalt-api.kwiatekm.tokyo/api/json",
-        "https://co.wuk.sh/api/json",
-        "https://cobalt.api.sc/api/json",
-        "https://dl.cobalt.tools/api/json",
-        "https://api.wuk.sh/api/json",
-    ]
-    ctx = ssl._create_unverified_context()
-    temp_download = output_path + ".cobalt.tmp"
-    last_err = None
-
-    for inst in instances:
-        if manager.stop_event.is_set():
-            raise KeyboardInterrupt("Job was cancelled by user.")
-        try:
-            manager.log(f"[Layer 1 Cobalt] Querying instance: {inst}...")
-            # Support both v7/v8 (isAudioOnly) and v10 (downloadMode: audio)
-            payload = json.dumps({
-                "url": clean_url,
-                "isAudioOnly": True,
-                "downloadMode": "audio",
-                "audioFormat": "mp3"
-            }).encode("utf-8")
-            req = urllib.request.Request(
-                inst,
-                data=payload,
-                headers={
-                    "Accept": "application/json",
-                    "Content-Type": "application/json",
-                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
-                }
-            )
-            with urllib.request.urlopen(req, timeout=12, context=ctx) as resp:
-                data = json.loads(resp.read().decode("utf-8"))
-                stream_url = data.get("url") or data.get("audio")
-                if stream_url:
-                    manager.log("[Layer 1 Cobalt] Direct stream URL resolved! Downloading audio stream...")
-                    req_dl = urllib.request.Request(stream_url, headers={"User-Agent": "Mozilla/5.0"})
-                    with urllib.request.urlopen(req_dl, timeout=60, context=ctx) as s_in, open(temp_download, "wb") as f_out:
-                        shutil.copyfileobj(s_in, f_out)
-
-                    transcode_to_standard_mp3(temp_download, output_path)
-                    if os.path.exists(temp_download):
-                        try:
-                            os.remove(temp_download)
-                        except Exception:
-                            pass
-                    if os.path.exists(output_path) and os.path.getsize(output_path) > 1024:
-                        return 0.0
-        except Exception as e:
-            last_err = e
-            manager.log(f"[Layer 1 Cobalt] Instance {inst} notice: {e}", level="DEBUG")
-
-    raise RuntimeError(f"Cobalt API failed across instances: {last_err}")
-
-
-# ─── LAYER 2 (ALTERNATIVE APIS): PIPED & INVIDIOUS ─────────────────────────────
-def download_layer2_alternative_apis(url: str, output_path: str, manager: JobManager) -> float:
-    """Layer 2: Alternative Public APIs (Piped & Invidious instances)."""
-    video_id = extract_video_id(url)
-    if not video_id:
-        raise ValueError(f"Could not extract video ID for Alternative APIs from: {url}")
-
-    piped_instances = [
-        "https://pipedapi.kavin.rocks",
-        "https://pipedapi.adminforge.de",
-        "https://piped-api.lunar.icu",
-        "https://pipedapi.tokhmi.xyz",
-        "https://pipedapi.ducks.party",
-        "https://api.piped.projectsegfau.lt",
-    ]
-    invidious_instances = [
-        "https://invidious.nerdvpn.de",
-        "https://inv.nadeko.net",
-        "https://invidious.drgns.space",
-        "https://yewtu.be",
-        "https://invidious.flokinet.to",
-        "https://vid.puffyan.us",
-        "https://iv.ggtyler.dev",
-        "https://invidious.private.coffee",
-    ]
-
-    ctx = ssl._create_unverified_context()
-    temp_download = output_path + ".altapi.tmp"
-    last_err = None
-
-    # 1. Try Piped Instances
-    for inst in piped_instances:
-        if manager.stop_event.is_set():
-            raise KeyboardInterrupt("Job was cancelled by user.")
-        try:
-            api_url = f"{inst}/streams/{video_id}"
-            manager.log(f"[Layer 2 Piped] Querying instance: {inst}...")
-            req = urllib.request.Request(api_url, headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"})
-            with urllib.request.urlopen(req, timeout=8, context=ctx) as resp:
-                data = json.loads(resp.read().decode("utf-8"))
-                audio_streams = data.get("audioStreams", [])
-                if audio_streams:
-                    best_stream = max(audio_streams, key=lambda s: int(s.get("bitrate", 0) or 0))
-                    audio_url = best_stream.get("url")
-                    if audio_url:
-                        if audio_url.startswith("/"):
-                            audio_url = inst + audio_url
-                        manager.log(f"[Layer 2 Piped] Audio stream resolved ({best_stream.get('format', 'audio')}, {best_stream.get('quality', '')})! Streaming...")
-                        req_dl = urllib.request.Request(audio_url, headers={"User-Agent": "Mozilla/5.0"})
-                        with urllib.request.urlopen(req_dl, timeout=60, context=ctx) as s_in, open(temp_download, "wb") as f_out:
-                            shutil.copyfileobj(s_in, f_out)
-                        transcode_to_standard_mp3(temp_download, output_path)
-                        if os.path.exists(temp_download):
-                            try:
-                                os.remove(temp_download)
-                            except Exception:
-                                pass
-                        if os.path.exists(output_path) and os.path.getsize(output_path) > 1024:
-                            return 0.0
-        except Exception as e:
-            last_err = e
-            manager.log(f"[Layer 2 Piped] Instance {inst} notice: {e}", level="DEBUG")
-
-    # 2. Try Invidious Instances
-    for inst in invidious_instances:
-        if manager.stop_event.is_set():
-            raise KeyboardInterrupt("Job was cancelled by user.")
-        try:
-            api_url = f"{inst}/api/v1/videos/{video_id}"
-            manager.log(f"[Layer 2 Invidious] Querying instance: {inst}...")
-            req = urllib.request.Request(api_url, headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"})
-            with urllib.request.urlopen(req, timeout=8, context=ctx) as resp:
-                data = json.loads(resp.read().decode("utf-8"))
-                formats = data.get("adaptiveFormats", [])
-                audio_formats = [f for f in formats if "audio" in f.get("type", "").lower() and f.get("url")]
-                if audio_formats:
-                    best_stream = max(audio_formats, key=lambda s: int(s.get("bitrate", 0) or 0))
-                    audio_url = best_stream.get("url")
-                    if audio_url:
-                        manager.log(f"[Layer 2 Invidious] Audio stream resolved ({best_stream.get('type')})! Streaming...")
-                        req_dl = urllib.request.Request(audio_url, headers={"User-Agent": "Mozilla/5.0"})
-                        with urllib.request.urlopen(req_dl, timeout=60, context=ctx) as s_in, open(temp_download, "wb") as f_out:
-                            shutil.copyfileobj(s_in, f_out)
-                        transcode_to_standard_mp3(temp_download, output_path)
-                        if os.path.exists(temp_download):
-                            try:
-                                os.remove(temp_download)
-                            except Exception:
-                                pass
-                        if os.path.exists(output_path) and os.path.getsize(output_path) > 1024:
-                            return 0.0
-        except Exception as e:
-            last_err = e
-            manager.log(f"[Layer 2 Invidious] Instance {inst} notice: {e}", level="DEBUG")
-
-    raise RuntimeError(f"Alternative APIs (Piped & Invidious) failed: {last_err}")
-
-
-# ─── LAYER 3 (ADVANCED BYPASS): yt-dlp SPOOFING, PROXIES & EMBEDDED JS ────────
-def download_layer3_advanced_bypass(url: str, output_path: str, manager: JobManager, proxy_url: str = "") -> float:
-    """Layer 3: Advanced yt-dlp extraction with multi-client spoofing, Node.js EJS challenge solver, and proxy rotation."""
-    output_dir = os.path.dirname(output_path)
-    base_name = os.path.splitext(os.path.basename(output_path))[0]
-    template_path = os.path.join(output_dir, f"{base_name}.%(ext)s")
-
-    def yt_hook(d):
-        if manager.stop_event.is_set():
-            raise KeyboardInterrupt("Job was cancelled by user.")
-        if d.get("status") == "downloading":
-            total = d.get("total_bytes") or d.get("total_bytes_estimate") or 0
-            downloaded = d.get("downloaded_bytes", 0)
-            if total > 0:
-                pct = (downloaded / total) * 100
-                manager.progress = round(1.0 + (pct * 0.14), 1)
-                manager.message = f"[Layer 3 Advanced] Downloading: {pct:.1f}% ({downloaded//1024//1024}MB / {total//1024//1024}MB)"
-
-    effective_proxy = resolve_effective_proxy(proxy_url)
-    resolved_cookie_file = resolve_cookies_file()
-
-    if effective_proxy:
-        manager.log(f"[Layer 3 Advanced] Active Proxy configured: {effective_proxy.split('@')[-1]}")
-    if resolved_cookie_file:
-        manager.log(f"[Layer 3 Advanced] Cookie file detected: {os.path.basename(resolved_cookie_file)}")
-
-    # Check Node.js runtime for JavaScript challenge solving
-    has_node = shutil.which("node") is not None
-    if has_node:
-        manager.log("[Layer 3 Advanced] Embedded Node.js runtime detected for YouTube JS challenge solving.")
-
-    # Multi-client combinations in order of resilience
-    client_candidates = [
-        ["tv", "mweb", "android", "ios"],
-        ["web_embedded", "web", "web_safari"],
-        ["visionos"]
-    ]
-
-    last_exc = None
-    for client_list in client_candidates:
-        if manager.stop_event.is_set():
-            raise KeyboardInterrupt("Job was cancelled by user.")
-        try:
-            manager.log(f"[Layer 3 Advanced] Attempting yt-dlp with client suite: {client_list}...")
-            ydl_opts = {
-                "format": "ba/b/18/bestaudio/best",
-                "outtmpl": template_path,
-                "quiet": True,
-                "no_warnings": True,
-                "progress_hooks": [yt_hook],
-                "nocheckcertificate": True,
-                "extractor_args": {
-                    "youtube": {
-                        "player_client": client_list
-                    }
-                },
-                "http_headers": {
-                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
-                },
-                "postprocessors": [
-                    {
-                        "key": "FFmpegExtractAudio",
-                        "preferredcodec": "mp3",
-                        "preferredquality": "192",
-                    }
-                ],
-            }
-            if has_node:
-                ydl_opts["js_runtimes"] = {"node": {}}
-            if effective_proxy:
-                ydl_opts["proxy"] = effective_proxy
-            if resolved_cookie_file and any(c in ["web", "web_embedded", "mweb", "tv"] for c in client_list):
-                ydl_opts["cookiefile"] = resolved_cookie_file
-
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                info = ydl.extract_info(url, download=True)
-                duration = float(info.get("duration", 0.0) or 0.0)
-
-            # Check output file
-            if not os.path.exists(output_path):
-                candidates = [os.path.join(output_dir, f) for f in os.listdir(output_dir) if f.startswith(base_name) and f.endswith((".mp3", ".m4a", ".webm", ".opus"))]
-                if candidates and os.path.exists(candidates[0]):
-                    if candidates[0] != output_path:
-                        transcode_to_standard_mp3(candidates[0], output_path)
-                        try:
-                            os.remove(candidates[0])
-                        except Exception:
-                            pass
-
-            if os.path.exists(output_path) and os.path.getsize(output_path) > 1024:
-                manager.log("[Layer 3 Advanced] yt-dlp download succeeded!")
-                return duration
-        except Exception as exc:
-            last_exc = exc
-            manager.log(f"[Layer 3 Advanced] Client suite {client_list} failed: {exc}", level="DEBUG")
-
-    # If direct requests fail and no proxy was set, attempt fast public proxy rotation
-    if not effective_proxy:
-        try:
-            manager.log("[Layer 3 Advanced] Direct cloud connection flagged. Attempting automated elite proxy rotation...")
-            proxy_feed = "https://api.proxyscrape.com/v2/?request=displayproxies&protocol=http&timeout=3000&country=all&ssl=yes&anonymity=elite"
-            req_p = urllib.request.Request(proxy_feed, headers={"User-Agent": "Mozilla/5.0"})
-            with urllib.request.urlopen(req_p, timeout=5) as r_p:
-                proxy_list = [p.strip() for p in r_p.read().decode("utf-8").splitlines() if p.strip()]
-
-            for p_candidate in proxy_list[:4]:
-                if manager.stop_event.is_set():
-                    raise KeyboardInterrupt("Job was cancelled by user.")
-                try:
-                    rotated_proxy = f"http://{p_candidate}"
-                    manager.log(f"[Layer 3 Advanced] Testing rotated proxy: {p_candidate}...")
-                    ydl_opts_rot = {
-                        "format": "ba/b/18/bestaudio/best",
-                        "outtmpl": template_path,
-                        "quiet": True,
-                        "no_warnings": True,
-                        "proxy": rotated_proxy,
-                        "socket_timeout": 8,
-                        "nocheckcertificate": True,
-                        "extractor_args": {"youtube": {"player_client": ["mweb", "android", "ios"]}},
-                        "postprocessors": [{"key": "FFmpegExtractAudio", "preferredcodec": "mp3", "preferredquality": "192"}],
-                    }
-                    if has_node:
-                        ydl_opts_rot["js_runtimes"] = {"node": {}}
-                    with yt_dlp.YoutubeDL(ydl_opts_rot) as ydl:
-                        info = ydl.extract_info(url, download=True)
-                        duration = float(info.get("duration", 0.0) or 0.0)
-                    if os.path.exists(output_path) and os.path.getsize(output_path) > 1024:
-                        manager.log(f"[Layer 3 Advanced] Rotated proxy {p_candidate} succeeded!")
-                        return duration
-                except Exception as p_err:
-                    manager.log(f"[Layer 3 Advanced] Rotated proxy {p_candidate} notice: {p_err}", level="DEBUG")
-        except Exception as rot_err:
-            manager.log(f"[Layer 3 Advanced] Proxy rotation unavailable: {rot_err}", level="DEBUG")
-
-    # Final bypass attempt with pytubefix matrix
-    try:
-        from pytubefix import YouTube as PyTubeFix
-        manager.log("[Layer 3 Advanced] Trying pytubefix client matrix...")
-        for c in ["ANDROID", "IOS", "MWEB", "VISION_OS", "WEB"]:
-            if manager.stop_event.is_set():
-                raise KeyboardInterrupt("Job was cancelled by user.")
-            try:
-                proxies_arg = {"http": effective_proxy, "https": effective_proxy} if effective_proxy else None
-                yt = PyTubeFix(url, client=c, proxies=proxies_arg)
-                audio_stream = yt.streams.get_audio_only() or yt.streams.filter(only_audio=True).first()
-                if audio_stream:
-                    temp_pt = output_path + f".pt_{c}.tmp"
-                    audio_stream.download(output_path=output_dir, filename=os.path.basename(temp_pt))
-                    if os.path.exists(temp_pt) and os.path.getsize(temp_pt) > 1024:
-                        transcode_to_standard_mp3(temp_pt, output_path)
-                        try:
-                            os.remove(temp_pt)
-                        except Exception:
-                            pass
-                        if os.path.exists(output_path) and os.path.getsize(output_path) > 1024:
-                            manager.log(f"[Layer 3 Advanced] pytubefix (client={c}) succeeded!")
-                            return 0.0
-            except Exception as pt_err:
-                manager.log(f"[Layer 3 Advanced] pytubefix client={c} error: {pt_err}", level="DEBUG")
-    except ImportError:
-        pass
-
-    raise RuntimeError(f"Advanced bypass (yt-dlp, proxy rotation, pytubefix) failed: {last_exc}")
-
-
-# ─── LAYER 4: MASTER 4-LAYER WATERFALL ORCHESTRATOR & FAIL-SAFE ────────────────
-def download_youtube_audio(
-    url: str,
+# ─── MEDIA INGESTION & STANDARDIZATION (DIRECT FILE UPLOAD ARCHITECTURE) ──────
+def ingest_uploaded_media(
+    uploaded_path: str,
     output_dir: str,
-    manager: JobManager,
-    proxy_url: str = ""
+    manager: JobManager
 ) -> Tuple[str, float]:
-    """Sequential 4-Layer Waterfall Audio Extraction with Strict Memory Isolation:
-    Layer 1 (Fast & Light): Cobalt API
-    Layer 2 (Alternative APIs): Piped & Invidious APIs
-    Layer 3 (Advanced Bypass): yt-dlp multi-client spoofing, proxy rotation & Node.js EJS
-    Layer 4 (Ultimate Fail-safe): Graceful UI activation for direct MP3 upload or Google Drive link
+    """Ingests, validates, and normalizes direct user-uploaded audio/video file.
+    
+    1. Validates that the file exists and is readable (supports up to 200MB+).
+    2. Uses FFmpeg to extract audio stream and standardize into 44.1kHz stereo 192k MP3.
+    3. Runs synchronous garbage collection to keep RAM minimal before chunking.
     """
-    timestamp = int(time.time())
-    final_output_path = os.path.join(output_dir, f"source_audio_{timestamp}.mp3")
-    duration = 0.0
-    download_success = False
+    if not uploaded_path or not os.path.exists(uploaded_path):
+        raise FileNotFoundError(f"Uploaded audio file not found on disk: {uploaded_path}")
 
-    # Check for direct audio URL or Google Drive link
-    if is_direct_or_gdrive_url(url):
-        dur = download_direct_or_gdrive_audio(url, final_output_path, manager)
-        return final_output_path, dur
-
-    manager.log(f"[Waterfall Downloader] Initiating 4-Layer Waterfall Extraction for: {url}")
-    manager.status = "DOWNLOADING"
-    manager.message = "Attempting Layer 1 (Cobalt API)..."
+    file_size_mb = os.path.getsize(uploaded_path) / (1024 * 1024)
+    filename = os.path.basename(uploaded_path)
+    manager.log(f"[Source Ingest] 📁 Processing uploaded media: {filename} ({file_size_mb:.1f} MB)")
+    manager.status = "INGESTING"
+    manager.message = f"Normalizing {filename} ({file_size_mb:.1f} MB) via FFmpeg..."
+    manager.progress = 5.0
     manager.save_to_disk()
 
-    # ──────────────────────────────────────────────────────────────────────────
-    # LAYER 1: Fast & Light Cobalt API
-    # ──────────────────────────────────────────────────────────────────────────
+    timestamp = int(time.time())
+    final_output_path = os.path.join(output_dir, f"source_audio_{timestamp}.mp3")
+
+    # Fast, multi-threaded FFmpeg transcode/stream extraction to 44.1kHz stereo 192k MP3
+    cmd = [
+        "ffmpeg", "-y",
+        "-i", uploaded_path,
+        "-vn",
+        "-ar", "44100",
+        "-ac", "2",
+        "-b:a", "192k",
+        final_output_path
+    ]
+    res = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    if res.returncode != 0 or not os.path.exists(final_output_path) or os.path.getsize(final_output_path) == 0:
+        if uploaded_path.lower().endswith(".mp3"):
+            shutil.copy2(uploaded_path, final_output_path)
+        else:
+            raise RuntimeError(f"FFmpeg failed to extract and standardize audio from: {filename}")
+
+    # Measure duration with pydub and immediately delete probe object
     try:
-        manager.log("[Waterfall] 🔹 [Layer 1/4] Attempting fast & light Cobalt API extraction...")
-        duration = download_layer1_cobalt(url, final_output_path, manager)
-        if os.path.exists(final_output_path) and os.path.getsize(final_output_path) > 1024:
-            manager.log("[Waterfall] ✅ Layer 1 (Cobalt API) download succeeded!")
-            download_success = True
-    except Exception as e1:
-        if manager.stop_event.is_set():
-            raise
-        manager.log(f"[Waterfall] ⚠️ Layer 1 (Cobalt) failed: {e1}. Falling back to Layer 2 (Piped & Invidious APIs)...", level="WARNING")
+        probe = AudioSegment.from_file(final_output_path)
+        duration_sec = len(probe) / 1000.0
+        del probe
+    except Exception:
+        duration_sec = 60.0
 
-    # ──────────────────────────────────────────────────────────────────────────
-    # LAYER 2: Alternative APIs (Piped & Invidious)
-    # ──────────────────────────────────────────────────────────────────────────
-    if not download_success:
-        try:
-            manager.message = "Attempting Layer 2 (Piped & Invidious APIs)..."
-            manager.log("[Waterfall] 🔹 [Layer 2/4] Attempting Alternative APIs (Piped & Invidious)...")
-            duration = download_layer2_alternative_apis(url, final_output_path, manager)
-            if os.path.exists(final_output_path) and os.path.getsize(final_output_path) > 1024:
-                manager.log("[Waterfall] ✅ Layer 2 (Alternative APIs) download succeeded!")
-                download_success = True
-        except Exception as e2:
-            if manager.stop_event.is_set():
-                raise
-            manager.log(f"[Waterfall] ⚠️ Layer 2 (Alternative APIs) failed: {e2}. Falling back to Layer 3 (Advanced Bypass)...", level="WARNING")
+    # Purge any ingestion variables from RAM
+    gc.collect()
 
-    # ──────────────────────────────────────────────────────────────────────────
-    # LAYER 3: Advanced Bypass (yt-dlp spoofing, proxy rotation, Node.js EJS)
-    # ──────────────────────────────────────────────────────────────────────────
-    if not download_success:
-        try:
-            manager.message = "Attempting Layer 3 (Advanced yt-dlp & proxy bypass)..."
-            manager.log("[Waterfall] 🔹 [Layer 3/4] Attempting Advanced yt-dlp multi-client & proxy bypass...")
-            duration = download_layer3_advanced_bypass(url, final_output_path, manager, proxy_url=proxy_url)
-            if os.path.exists(final_output_path) and os.path.getsize(final_output_path) > 1024:
-                manager.log("[Waterfall] ✅ Layer 3 (Advanced Bypass) download succeeded!")
-                download_success = True
-        except Exception as e3:
-            if manager.stop_event.is_set():
-                raise
-            manager.log(f"[Waterfall] ⚠️ Layer 3 (Advanced Bypass) failed: {e3}", level="ERROR")
-
-    # ──────────────────────────────────────────────────────────────────────────
-    # LAYER 4: Ultimate Fail-safe (Graceful UI Guidance & Action Prompt)
-    # ──────────────────────────────────────────────────────────────────────────
-    if not download_success or not os.path.exists(final_output_path):
-        err_msg = (
-            "YouTube datacenter IP restrictions blocked automated extraction across all 3 programmatic layers. "
-            "Please use the '⚡ Fast Direct MP3 Upload' box above (or provide a direct Google Drive link / custom proxy in Advanced Settings) to proceed with 100% reliability."
-        )
-        manager.log(f"[Waterfall] 🛑 [Layer 4/4 Fail-Safe Activated] {err_msg}", level="ERROR")
-        manager.status = "FAILED"
-        manager.message = "Extraction blocked by YouTube datacenter IP restrictions. Please use Direct MP3 Upload."
-        manager.save_to_disk()
-        raise RuntimeError(err_msg)
-
-    # Fallback duration measurement if metadata lacked duration
-    if duration <= 0.0:
-        try:
-            probe = AudioSegment.from_file(final_output_path)
-            duration = len(probe) / 1000.0
-            del probe
-            gc.collect()
-        except Exception:
-            duration = 3600.0
-
-    manager.log(f"[Downloader] Completed! Master source file ready: {os.path.basename(final_output_path)} (Duration: {duration:.1f}s / {duration/60:.1f}m)")
-    return final_output_path, duration
+    manager.log(f"[Source Ingest] ✅ Master audio standardized: {os.path.basename(final_output_path)} (Duration: {duration_sec:.1f}s / {duration_sec/60:.1f}m)")
+    manager.progress = 10.0
+    manager.save_to_disk()
+    return final_output_path, duration_sec
 
 
 # ─── OOM-SAFE AUDIO CHUNKING (1-2 MINUTE CHUNKS) ──────────────────────────────
@@ -1565,12 +1084,10 @@ def stitch_chunks_pydub(chunk_paths: List[str], final_output_path: str, manager:
 # ─── STEP 3: SEQUENTIAL PIPELINE CONTROLLER & STORAGE CLEANUP ──────────────────
 def run_pipeline_worker(
     manager: JobManager,
-    youtube_url: str,
+    uploaded_audio_path: str,
     chunk_duration_sec: int,
     api_key_1: str = "",
-    api_key_2: str = "",
-    uploaded_audio_path: Optional[str] = None,
-    proxy_url: str = ""
+    api_key_2: str = ""
 ):
     """The master background worker executing the full pipeline sequentially with Storage Cleanup."""
     try:
@@ -1586,55 +1103,21 @@ def run_pipeline_worker(
             manager.log(f"❌ {err_msg}", level="ERROR")
             raise ValueError(err_msg)
 
-        if uploaded_audio_path and os.path.exists(uploaded_audio_path):
-            source_display = os.path.basename(uploaded_audio_path)
-            manager.log(f"🎬 Starting Auto Dubbing Pipeline with Uploaded Audio: {source_display}")
-        else:
-            manager.log(f"🎬 Starting Auto Dubbing Pipeline for: {youtube_url}")
+        source_display = os.path.basename(uploaded_audio_path)
+        manager.log(f"🎬 Starting Auto Dubbing Pipeline with Uploaded Media: {source_display}")
         manager.log("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
 
-        # 1. Source Audio Ingestion (Direct Upload Fail-Safe or YouTube Downloader)
-        if uploaded_audio_path and os.path.exists(uploaded_audio_path):
-            manager.log(f"[Source] 📁 Direct audio file detected: {os.path.basename(uploaded_audio_path)}")
-            manager.log("[Source] Bypassing YouTube download completely to avoid IP blocks/bot detection!")
-            manager.status = "DOWNLOADING"
-            manager.message = "Preparing and standardizing uploaded audio file..."
-            manager.progress = 5.0
-
-            timestamp = int(time.time())
-            source_audio_path = os.path.join(WORKSPACE_DIR, f"source_audio_{timestamp}.mp3")
-
-            # Normalize to 44.1kHz stereo 192k MP3 via FFmpeg
-            manager.log("[Source] Converting uploaded audio to 44.1kHz stereo MP3 via FFmpeg...")
-            cmd = [
-                "ffmpeg", "-y", "-i", uploaded_audio_path,
-                "-vn", "-ar", "44100", "-ac", "2", "-b:a", "192k",
-                source_audio_path
-            ]
-            res = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            if res.returncode != 0 or not os.path.exists(source_audio_path):
-                shutil.copy2(uploaded_audio_path, source_audio_path)
-
-            try:
-                probe = AudioSegment.from_file(source_audio_path)
-                duration_sec = len(probe) / 1000.0
-                del probe
-                gc.collect()
-            except Exception:
-                duration_sec = 60.0
-
-            manager.log(f"[Source] ✅ Uploaded audio ready! Duration: {duration_sec:.1f}s ({duration_sec / 60:.1f} min)")
-            manager.progress = 10.0
-        else:
-            source_audio_path, duration_sec = download_youtube_audio(
-                youtube_url, WORKSPACE_DIR, manager, proxy_url=proxy_url
-            )
+        # 1. Source Media Ingestion & Standardization (Direct File Upload Architecture)
+        source_audio_path, duration_sec = ingest_uploaded_media(
+            uploaded_audio_path, WORKSPACE_DIR, manager
+        )
 
         # STRICT SYNCHRONOUS MEMORY MANAGEMENT:
-        # Guarantee that all network buffers, temporary byte streams, and downloader objects
-        # are completely purged from RAM before loading the chunking and dubbing pipeline.
+        # Guarantee that all ingestion variables and temporary buffers are completely purged
+        # from RAM before chunking and initiating the translation / TTS pipeline.
+        # Zero heavy models (TTS/Whisper) are loaded during upload or ingestion.
         gc.collect()
-        manager.log("[Memory Guard] Download phase finished and network buffers purged via gc.collect(). No heavy AI models were loaded during download.")
+        manager.log("[Memory Guard] Ingestion phase finished and memory purged via gc.collect(). No heavy AI models were loaded during upload/ingestion.")
 
         if manager.stop_event.is_set():
             raise KeyboardInterrupt("Job was cancelled by user.")
@@ -1831,7 +1314,7 @@ def get_dashboard_state() -> Tuple[Any, ...]:
     status_colors = {
         "IDLE": ("#4b5563", "⚪ IDLE"),
         "STARTING": ("#3b82f6", "🔵 STARTING"),
-        "DOWNLOADING": ("#0ea5e9", "📥 DOWNLOADING AUDIO"),
+        "INGESTING": ("#0ea5e9", "📁 INGESTING & STANDARDIZING"),
         "CHUNKING": ("#8b5cf6", "✂️ CHUNKING (OOM-SAFE)"),
         "PROCESSING": ("#f59e0b", f"⚡ PROCESSING ({state['current_language'] or '...' })"),
         "COMPLETED": ("#10b981", "✅ COMPLETED"),
@@ -1858,7 +1341,7 @@ def get_dashboard_state() -> Tuple[Any, ...]:
     fr_file = completed.get("French") if (completed.get("French") and os.path.exists(completed.get("French", ""))) else None
     pt_file = completed.get("Portuguese") if (completed.get("Portuguese") and os.path.exists(completed.get("Portuguese", ""))) else None
 
-    is_running = status in ["STARTING", "DOWNLOADING", "CHUNKING", "PROCESSING"]
+    is_running = status in ["STARTING", "INGESTING", "CHUNKING", "PROCESSING"]
     start_btn_interactive = not is_running
     cancel_btn_interactive = is_running
 
@@ -1893,12 +1376,10 @@ def extract_uploaded_path(file_obj: Any) -> Optional[str]:
 
 
 def progressive_start_pipeline(
-    url: str,
     uploaded_file: Any,
     chunk_duration: int,
     api_key_1: str,
-    api_key_2: str,
-    custom_proxy: str = ""
+    api_key_2: str
 ):
     """Gradio generator yielding live updates.
     
@@ -1907,11 +1388,10 @@ def progressive_start_pipeline(
     immediately yields the updated dashboard with that specific file ready for listening/download,
     while subsequent languages continue processing seamlessly.
     """
-    url = (url or "").strip()
     uploaded_audio = extract_uploaded_path(uploaded_file)
-    if not url and not uploaded_audio:
+    if not uploaded_audio:
         yield (
-            "<div style='color: #ef4444; padding: 10px;'>⚠️ Please enter a valid YouTube URL or upload an audio file directly using Fast Direct MP3 Upload.</div>",
+            "<div style='color: #ef4444; padding: 10px;'>⚠️ Please upload an audio or video file to begin dubbing (up to 200MB+ supported).</div>",
             *get_dashboard_state()[1:]
         )
         return
@@ -1940,12 +1420,10 @@ def progressive_start_pipeline(
         return
 
     success, msg = job_manager.start_job(
-        url=url,
+        uploaded_audio_path=uploaded_audio,
         chunk_duration_sec=int(chunk_duration),
         api_key_1=api_key_1,
-        api_key_2=api_key_2,
-        uploaded_audio_path=uploaded_audio,
-        proxy_url=custom_proxy
+        api_key_2=api_key_2
     )
     if not success:
         yield get_dashboard_state()
@@ -1975,18 +1453,19 @@ def handle_cancel_click():
 
 
 # ─── BUILD GRADIO BLOCKS APPLICATION ──────────────────────────────────────────
-with gr.Blocks(theme=gr.themes.Soft(primary_hue="indigo", neutral_hue="slate"), css=CUSTOM_CSS, title="YouTube Auto Dubber") as demo:
+with gr.Blocks(theme=gr.themes.Soft(primary_hue="indigo", neutral_hue="slate"), css=CUSTOM_CSS, title="Media Auto Dubber") as demo:
     
     with gr.Column(elem_classes=["header-card"]):
         gr.Markdown(
             """
-            # 🎙️ YouTube Long-Form Auto Dubber (Anime Theory)
-            ### AI-Powered Background Dubbing with Kokoro-ONNX & Progressive Live Yield Downloads
+            # 🎙️ Long-Form Media Auto Dubber
+            ### 100% Direct File Stream Upload & AI Dubbing with Kokoro-ONNX (Hindi, Spanish, French, Portuguese)
             """
         )
         gr.HTML(
             """
             <div class="badge-row">
+                <span class="tech-badge">📁 Direct Disk Stream (Up to 200MB+)</span>
                 <span class="tech-badge">⚡ Progressive Yield (Instant Download Per Language)</span>
                 <span class="tech-badge">🗣️ Kokoro-ONNX CPU Synthesis</span>
                 <span class="tech-badge">🎵 Pydub Master Audio Concatenation</span>
@@ -1996,27 +1475,15 @@ with gr.Blocks(theme=gr.themes.Soft(primary_hue="indigo", neutral_hue="slate"), 
             """
         )
 
-    # 1. Inputs: Video URL, Direct MP3 Upload & Two-Key Configuration
+    # 1. Inputs: Direct Media File Upload & Configuration
     with gr.Row():
-        with gr.Column(scale=6):
-            url_input = gr.Textbox(
-                label="YouTube Video URL or Direct / Google Drive Link",
-                placeholder="https://www.youtube.com/watch?v=... or direct MP3 / Google Drive audio link",
-                lines=1,
-            )
+        with gr.Column(scale=7):
             file_upload_input = gr.File(
-                file_types=[".mp3", ".wav", ".m4a"],
+                label="📁 Upload Audio or Video File (Direct Stream, Up to 200MB+)",
+                file_types=[".mp3", ".wav", ".m4a", ".aac", ".ogg", ".flac", ".mp4", ".mkv", ".webm"],
                 type="filepath",
-                label="⚡ Fast Direct MP3 Upload (100% Reliable Fail-Safe)",
             )
-            with gr.Accordion("🌐 Advanced Network & Proxy Settings (Datacenter IP Bypass)", open=False):
-                proxy_input = gr.Textbox(
-                    label="Custom Proxy URL (Optional HTTP / SOCKS5)",
-                    placeholder="e.g., http://user:pass@host:port or socks5://host:port (Bypasses Hugging Face cloud IP bans)",
-                    value=os.environ.get("YTDL_PROXY", os.environ.get("PROXY_URL", "")),
-                    lines=1,
-                )
-        with gr.Column(scale=6):
+        with gr.Column(scale=5):
             chunk_slider = gr.Slider(
                 minimum=60,
                 maximum=180,
@@ -2107,7 +1574,7 @@ with gr.Blocks(theme=gr.themes.Soft(primary_hue="indigo", neutral_hue="slate"), 
     # Progressive Yield Generator triggered on start click
     start_btn.click(
         fn=progressive_start_pipeline,
-        inputs=[url_input, file_upload_input, chunk_slider, api_key_1_input, api_key_2_input, proxy_input],
+        inputs=[file_upload_input, chunk_slider, api_key_1_input, api_key_2_input],
         outputs=ui_outputs,
     )
 

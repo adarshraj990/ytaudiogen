@@ -1,3 +1,2 @@
 ffmpeg
 espeak-ng
-nodejs

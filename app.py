@@ -1741,220 +1741,7 @@ CUSTOM_CSS = """
 .lang-box:hover {
     border-color: #4f46e5;
 }
-.upload-card-wrapper {
-    background: #181826;
-    border: 1px solid #2f2f45;
-    border-radius: 12px;
-    padding: 16px;
-    margin-bottom: 12px;
 }
-.upload-dropzone-box {
-    border: 2px dashed #4b4b6a;
-    border-radius: 10px;
-    padding: 22px 16px;
-    text-align: center;
-    background: #13131e;
-    cursor: pointer;
-    transition: all 0.2s ease-in-out;
-}
-.upload-dropzone-box:hover, .upload-dropzone-box.drag-over {
-    border-color: #6366f1;
-    background: #1a1a2e;
-}
-.upload-progress-wrapper {
-    margin-top: 14px;
-    padding: 12px;
-    background: #12121c;
-    border: 1px solid #28283c;
-    border-radius: 8px;
-}
-.progress-bar-track {
-    width: 100%;
-    height: 14px;
-    background: #252538;
-    border-radius: 7px;
-    overflow: hidden;
-    margin: 8px 0;
-}
-.progress-bar-fill {
-    width: 0%;
-    height: 100%;
-    background: linear-gradient(90deg, #6366f1 0%, #a855f7 50%, #38bdf8 100%);
-    border-radius: 7px;
-    transition: width 0.15s ease-out;
-}
-"""
-
-UPLOAD_COMPONENT_HTML = """
-<div class="upload-card-wrapper">
-    <div class="upload-dropzone-box" id="upload-dropzone" onclick="document.getElementById('custom-file-input').click()">
-        <input type="file" id="custom-file-input" style="display: none;" accept=".mp3,.wav,.m4a,.aac,.ogg,.flac,.mp4,.mkv,.webm" />
-        <div style="font-size: 2.2rem; margin-bottom: 6px;">⚡📁</div>
-        <div style="font-size: 1.05rem; font-weight: 600; color: #f1f5f9;" id="upload-main-title">
-            Click to Browse or Drag & Drop Media File
-        </div>
-        <div style="font-size: 0.82rem; color: #94a3b8; margin-top: 4px;">
-            Fast Direct Stream Upload with Live Percentage (Up to 200MB+)
-        </div>
-    </div>
-    
-    <div class="upload-progress-wrapper" id="upload-progress-wrapper" style="display: none;">
-        <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 4px;">
-            <span id="upload-file-label" style="font-size: 0.88rem; font-weight: 600; color: #e2e8f0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 75%;">
-                Selected File
-            </span>
-            <span id="upload-percent-badge" style="background: #312e81; color: #818cf8; font-size: 0.85rem; font-weight: 700; padding: 2px 10px; border-radius: 12px; border: 1px solid #4338ca;">
-                0%
-            </span>
-        </div>
-        
-        <div class="progress-bar-track">
-            <div id="upload-progress-bar-fill" class="progress-bar-fill"></div>
-        </div>
-        
-        <div style="display: flex; justify-content: space-between; align-items: center; font-size: 0.8rem; color: #94a3b8;">
-            <span id="upload-bytes-counter">0.0 MB / 0.0 MB (0%)</span>
-            <span id="upload-status-indicator" style="color: #38bdf8; font-weight: 500;">Ready to upload</span>
-        </div>
-    </div>
-</div>
-
-<script>
-(function() {
-    function setupUploader() {
-        const fileInput = document.getElementById("custom-file-input");
-        const dropzone = document.getElementById("upload-dropzone");
-        const progressWrapper = document.getElementById("upload-progress-wrapper");
-        const fileLabel = document.getElementById("upload-file-label");
-        const percentBadge = document.getElementById("upload-percent-badge");
-        const barFill = document.getElementById("upload-progress-bar-fill");
-        const bytesCounter = document.getElementById("upload-bytes-counter");
-        const statusIndicator = document.getElementById("upload-status-indicator");
-
-        if (!fileInput || !dropzone || dropzone._initialized) return;
-        dropzone._initialized = true;
-
-        ['dragenter', 'dragover'].forEach(name => {
-            dropzone.addEventListener(name, (e) => {
-                e.preventDefault();
-                e.stopPropagation();
-                dropzone.classList.add('drag-over');
-            }, false);
-        });
-
-        ['dragleave', 'drop'].forEach(name => {
-            dropzone.addEventListener(name, (e) => {
-                e.preventDefault();
-                e.stopPropagation();
-                dropzone.classList.remove('drag-over');
-            }, false);
-        });
-
-        dropzone.addEventListener('drop', (e) => {
-            const dt = e.dataTransfer;
-            if (dt && dt.files && dt.files.length > 0) {
-                processUpload(dt.files[0]);
-            }
-        });
-
-        fileInput.addEventListener("change", function() {
-            if (this.files && this.files.length > 0) {
-                processUpload(this.files[0]);
-            }
-        });
-
-        function processUpload(file) {
-            const totalMB = (file.size / (1024 * 1024)).toFixed(1);
-            fileLabel.textContent = "📄 " + file.name;
-            percentBadge.textContent = "0%";
-            percentBadge.style.color = "#818cf8";
-            percentBadge.style.borderColor = "#4338ca";
-            percentBadge.style.background = "#312e81";
-            barFill.style.width = "0%";
-            barFill.style.background = "linear-gradient(90deg, #6366f1 0%, #a855f7 50%, #38bdf8 100%)";
-            bytesCounter.textContent = "0.0 MB / " + totalMB + " MB (0%)";
-            statusIndicator.textContent = "⚡ Streaming directly to disk...";
-            statusIndicator.style.color = "#38bdf8";
-            progressWrapper.style.display = "block";
-
-            const formData = new FormData();
-            formData.append("files", file);
-
-            const xhr = new XMLHttpRequest();
-            const basePath = window.location.pathname.replace(/\\/+$/, '');
-            const uploadUrl = (basePath ? basePath : '') + '/upload';
-            xhr.open("POST", uploadUrl, true);
-            xhr.withCredentials = true;
-
-            const startTime = Date.now();
-
-            xhr.upload.addEventListener("progress", function(e) {
-                if (e.lengthComputable && e.total > 0) {
-                    const percent = Math.min(99, Math.round((e.loaded / e.total) * 100));
-                    const loadedMB = (e.loaded / (1024 * 1024)).toFixed(1);
-                    const currentTotalMB = (e.total / (1024 * 1024)).toFixed(1);
-
-                    percentBadge.textContent = percent + "%";
-                    barFill.style.width = percent + "%";
-                    bytesCounter.textContent = loadedMB + " MB / " + currentTotalMB + " MB (" + percent + "%)";
-
-                    const elapsedSec = (Date.now() - startTime) / 1000;
-                    if (elapsedSec > 0.4) {
-                        const speed = ((e.loaded / (1024 * 1024)) / elapsedSec).toFixed(1);
-                        statusIndicator.textContent = "⚡ Uploading (" + speed + " MB/s)...";
-                    }
-                }
-            });
-
-            xhr.onload = function() {
-                if (xhr.status >= 200 && xhr.status < 300) {
-                    try {
-                        const res = JSON.parse(xhr.responseText);
-                        const serverPath = Array.isArray(res) ? res[0] : (res.path || res[0]);
-                        
-                        percentBadge.textContent = "100%";
-                        percentBadge.style.color = "#34d399";
-                        percentBadge.style.borderColor = "#059669";
-                        percentBadge.style.background = "#064e3b";
-                        barFill.style.width = "100%";
-                        barFill.style.background = "linear-gradient(90deg, #10b981 0%, #059669 100%)";
-                        bytesCounter.textContent = totalMB + " MB / " + totalMB + " MB (100%)";
-                        statusIndicator.textContent = "✅ Upload 100% Complete! Ready for dubbing.";
-                        statusIndicator.style.color = "#34d399";
-
-                        // Sync serverPath to Gradio internal textbox
-                        const targetInput = document.querySelector("#uploaded_path_box textarea, #uploaded_path_box input");
-                        if (targetInput) {
-                            targetInput.value = serverPath;
-                            targetInput.dispatchEvent(new Event("input", { bubbles: true }));
-                            targetInput.dispatchEvent(new Event("change", { bubbles: true }));
-                        }
-                    } catch (parseErr) {
-                        statusIndicator.textContent = "⚠️ Uploaded, verifying format...";
-                    }
-                } else {
-                    statusIndicator.textContent = "❌ Upload failed (HTTP " + xhr.status + ")";
-                    statusIndicator.style.color = "#ef4444";
-                }
-            };
-
-            xhr.onerror = function() {
-                statusIndicator.textContent = "❌ Network connection error during upload";
-                statusIndicator.style.color = "#ef4444";
-            };
-
-            xhr.send(formData);
-        }
-    }
-
-    if (document.readyState === "loading") {
-        document.addEventListener("DOMContentLoaded", setupUploader);
-    } else {
-        setTimeout(setupUploader, 300);
-    }
-    setInterval(setupUploader, 1500);
-})();
-</script>
 """
 
 def get_dashboard_state() -> Tuple[Any, ...]:
@@ -2032,7 +1819,6 @@ def extract_uploaded_path(file_obj: Any) -> Optional[str]:
 
 
 def progressive_start_pipeline(
-    direct_uploaded_path: str,
     uploaded_file: Any,
     chunk_duration: int,
     api_key_1: str,
@@ -2045,11 +1831,12 @@ def progressive_start_pipeline(
     immediately yields the updated dashboard with that specific file ready for listening/download,
     while subsequent languages continue processing seamlessly.
     """
-    direct_path = (direct_uploaded_path or "").strip()
-    uploaded_audio = direct_path if (direct_path and os.path.exists(direct_path)) else extract_uploaded_path(uploaded_file)
+    uploaded_audio = extract_uploaded_path(uploaded_file)
     if not uploaded_audio:
         yield (
-            "<div style='color: #ef4444; padding: 10px;'>⚠️ Please upload an audio or video file to begin dubbing (wait for 100% upload completion).</div>",
+            "<div style='color: #f87171; background: #2b1216; border: 1px solid #ef4444; border-radius: 8px; padding: 14px 18px; margin: 10px 0;'>"
+            "⚠️ <b>Please upload an audio or video file first.</b> Drag and drop or browse a media file above."
+            "</div>",
             *get_dashboard_state()[1:]
         )
         return
@@ -2135,18 +1922,18 @@ with gr.Blocks(theme=gr.themes.Soft(primary_hue="indigo", neutral_hue="slate"), 
     # 1. Inputs: Direct Media File Upload & Configuration
     with gr.Row():
         with gr.Column(scale=7):
-            upload_html = gr.HTML(UPLOAD_COMPONENT_HTML)
-            direct_upload_box = gr.Textbox(
-                visible=False,
-                elem_id="uploaded_path_box",
-                label="Direct Uploaded Disk Path",
+            media_file_input = gr.File(
+                label="📁 Drag & Drop or Select Audio / Video File (MP3, MP4, WAV, M4A, MKV, WebM up to 500MB)",
+                file_types=["audio", "video", ".mp3", ".wav", ".m4a", ".aac", ".ogg", ".flac", ".mp4", ".mkv", ".webm", ".avi"],
+                type="filepath",
+                interactive=True,
+                elem_id="main_media_file_uploader",
             )
-            with gr.Accordion("📂 Alternative: Standard File Browser", open=False):
-                file_upload_input = gr.File(
-                    label="Choose File via Standard Browser Dialog",
-                    file_types=[".mp3", ".wav", ".m4a", ".aac", ".ogg", ".flac", ".mp4", ".mkv", ".webm"],
-                    type="filepath",
-                )
+            gr.HTML(
+                "<div style='font-size: 0.85rem; color: #94a3b8; margin-top: 4px; padding: 2px 4px;'>"
+                "⚡ <b>Direct Local Stream:</b> Audio and video files are streamed directly to disk. Supports long 2–3 hour media without RAM overhead."
+                "</div>"
+            )
         with gr.Column(scale=5):
             chunk_slider = gr.Slider(
                 minimum=60,
@@ -2235,25 +2022,24 @@ with gr.Blocks(theme=gr.themes.Soft(primary_hue="indigo", neutral_hue="slate"), 
         cancel_btn,
     ]
 
-    def on_standard_file_uploaded(file_obj):
-        path = extract_uploaded_path(file_obj)
+    def on_file_uploaded(file_path):
+        path = extract_uploaded_path(file_path)
         if path and os.path.exists(path):
             size_mb = os.path.getsize(path) / (1024 * 1024)
             name = os.path.basename(path)
-            job_manager.log(f"[File Monitor] 📁 Upload complete: {name} ({size_mb:.1f} MB) - 100% ready")
-            return path
-        return ""
+            job_manager.log(f"[File Ingest] 📁 Media ready for dubbing: {name} ({size_mb:.1f} MB)")
+        return get_dashboard_state()
 
-    file_upload_input.upload(
-        fn=on_standard_file_uploaded,
-        inputs=[file_upload_input],
-        outputs=[direct_upload_box],
+    media_file_input.change(
+        fn=on_file_uploaded,
+        inputs=[media_file_input],
+        outputs=ui_outputs,
     )
 
     # Progressive Yield Generator triggered on start click
     start_btn.click(
         fn=progressive_start_pipeline,
-        inputs=[direct_upload_box, file_upload_input, chunk_slider, api_key_1_input, api_key_2_input],
+        inputs=[media_file_input, chunk_slider, api_key_1_input, api_key_2_input],
         outputs=ui_outputs,
     )
 

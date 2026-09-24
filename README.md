@@ -1,5 +1,5 @@
 ---
-title: Ytaudiogen
+title: Audiogenflow
 emoji: 🎙️
 colorFrom: indigo
 colorTo: gray

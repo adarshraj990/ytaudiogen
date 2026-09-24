@@ -24,20 +24,24 @@ A production-grade, background video dubbing application engineered to run smoot
    - Distinct canonical voices for Hindi (`hm_omega`), Spanish (`em_alex`), French (`ff_siwis`), and Portuguese (`pf_dora`).
    - Sentence sub-chunking (<220 chars) to prevent phoneme truncation.
 
-3. **🎵 Pydub Master Audio Concatenation**:
-   - Chunks are assembled sequentially using `pydub` with memory-safe batching and garbage collection.
+3. **🎯 Zero-Drift Audio Time-Syncing (atempo Clamping)**:
+   - Chunk-bounded duration matching using FFmpeg `atempo` (1.05x - 1.25x) and trailing silence padding, completely eliminating cumulative audio-video drift across 2–3 hour videos.
 
-4. **🧹 Automatic Server Storage Cleanup**:
+4. **⚡ Zero-RAM FFmpeg Master Concat Demuxer**:
+   - Chunks are assembled sequentially directly on disk using FFmpeg concat demuxer (<15MB RAM), replacing heavy in-memory arrays.
+
+5. **🧹 Automatic Server Storage Cleanup**:
    - Once a language's full MP3 is created and verified, intermediate 1-2 minute chunk files are purged immediately to preserve server disk space.
 
-5. **⚡ 4-Layer Zero-Sleep API Rotation**:
-   - Two-Key Round-Robin load balancing across sequential chunks.
-   - Primary `gemini-3.8-flash` with instant `try-except` fallback to `gemini-3.5-flash` on the same key without `time.sleep()`.
+6. **🔎 Dynamic Gemini Model Discovery & RPM-Aware Pacer**:
+   - Real-time API model verification (`gemini-1.5-flash`, `gemini-1.5-pro`, `gemini-2.0-flash`) with zero hardcoded model names.
+   - Smart 15 RPM throttling pacer (4.2s pre-call safety and 4.5s post-chunk pacing).
+   - Seamless failover from `GEMINI_API_KEY_1` to `GEMINI_API_KEY_2` on 429 quota exhaustion.
 
-6. **🍥 Naruto Lore & Anime Terminology Preservation**:
+7. **🍥 Naruto Lore & Anime Terminology Preservation**:
    - Specialized prompt preserving terms like *Sharingan, Hokage, Jutsu, Chakra, Uchiha, Rasengan, Akatsuki, Konoha*.
    - Phonetic Devanagari transliteration for Hindi without literal translation.
 
-7. **🛡️ OOM-Safe 90-Second Chunking & Background Worker**:
+8. **🛡️ OOM-Safe 90-Second Chunking & Background Worker**:
    - Out-of-process FFmpeg stream chunking prevents OOM crashes on 16GB RAM.
    - Decoupled daemon worker allows users to close the browser tab at any time.

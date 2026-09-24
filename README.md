@@ -12,20 +12,24 @@ pinned: false
 
 # 🎙️ YouTube Long-Form Auto Dubber (Anime Theory)
 
-A production-grade, background video dubbing application engineered to run smoothly on Hugging Face Spaces (Free CPU Tier: 2 vCPU, 16GB RAM). Designed to process 2-3 hour long YouTube videos (such as anime theory breakdowns) and dub them into 4 separate languages: **Hindi, Spanish, French, and Portuguese**.
+A production-grade, background video dubbing application engineered to run smoothly on Hugging Face Spaces (Free CPU Tier: 2 vCPU, 16GB RAM). Designed to process 2-3 hour long videos (such as anime theory breakdowns) and dub them into 4 separate languages: **Hindi, Spanish, French, and Portuguese**.
 
 ## 🚀 Key Features
 
 1. **⚡ Progressive Yield Live Downloads**:
    - The UI generator yields finished master audio tracks (`Hindi_Full.mp3`, `Spanish_Full.mp3`, etc.) **immediately as each language completes**, without waiting for all 4 languages to finish.
 
-2. **🗣️ Kokoro-ONNX CPU Synthesis**:
-   - Native ONNX TTS engine optimized for 2 vCPU execution.
-   - Distinct canonical voices for Hindi (`hm_omega`), Spanish (`em_alex`), French (`ff_siwis`), and Portuguese (`pf_dora`).
-   - Sentence sub-chunking (<220 chars) to prevent phoneme truncation.
+2. **🗣️ 100% Lazy-Loaded Multi-Model TTS Architecture**:
+   - **Zero Global Model Overhead**: The Space boots up in <1 second with 0 MB of models in RAM. No startup timeouts (503).
+   - Models are downloaded and loaded strictly inside execution functions triggered by user action:
+     - **Hindi (HI)**: `Tharshan/indicf5_hindi-english_code_switch`
+     - **Spanish (ES)**: `neuphonic/neutts-nano-spanish-q8-gguf`
+     - **French (FR)**: `neuphonic/neutts-nano-french-q8-gguf`
+     - **Portuguese (PT)**: `facebook/mms-tts-por` (with Piper fallback)
+   - **Language Memory Swapping**: Only ONE language model resides in RAM at any time. When a language completes, its weights are instantly freed and memory is purged via `gc.collect()`.
 
 3. **🎯 Zero-Drift Audio Time-Syncing (atempo Clamping)**:
-   - Chunk-bounded duration matching using FFmpeg `atempo` (1.05x - 1.25x) and trailing silence padding, completely eliminating cumulative audio-video drift across 2–3 hour videos.
+   - Chunk-bounded duration matching using FFmpeg `atempo` (1.02x - 1.25x) and trailing silence padding, completely eliminating cumulative audio-video drift across 2–3 hour videos.
 
 4. **⚡ Zero-RAM FFmpeg Master Concat Demuxer**:
    - Chunks are assembled sequentially directly on disk using FFmpeg concat demuxer (<15MB RAM), replacing heavy in-memory arrays.

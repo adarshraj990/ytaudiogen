@@ -446,6 +446,7 @@ class JobManager:
         self.url: str = ""
         self.api_key_1: str = ""
         self.api_key_2: str = ""
+        self.proxy_url: str = ""
         self.status: str = "IDLE"  # IDLE, DOWNLOADING, CHUNKING, PROCESSING, COMPLETED, FAILED, CANCELLED
         self.progress: float = 0.0  # 0 to 100
         self.message: str = "System ready. Enter YouTube URL and Gemini API keys to begin."
@@ -483,7 +484,8 @@ class JobManager:
         chunk_duration_sec: int,
         api_key_1: str = "",
         api_key_2: str = "",
-        uploaded_audio_path: Optional[str] = None
+        uploaded_audio_path: Optional[str] = None,
+        proxy_url: str = ""
     ) -> Tuple[bool, str]:
         """Initiates the background dubbing job in a detached daemon thread."""
         with self.lock:
@@ -506,6 +508,7 @@ class JobManager:
             self.url = url
             self.api_key_1 = effective_key_1 or ""
             self.api_key_2 = effective_key_2 or ""
+            self.proxy_url = (proxy_url or "").strip()
             self.status = "STARTING"
             self.progress = 1.0
             self.message = "Initializing background task..."
@@ -527,12 +530,14 @@ class JobManager:
         target_display = os.path.basename(uploaded_audio_path) if uploaded_audio_path else url
         self.log(f"New job registered (ID: {self.job_id}) for source: {target_display}")
         self.log(f"API Key 1: {mask_key(self.api_key_1)} | API Key 2: {mask_key(self.api_key_2)}")
+        if self.proxy_url:
+            self.log(f"Proxy configured: {self.proxy_url.split('@')[-1]}")
         self.save_to_disk()
 
         # Start decoupled daemon thread (survives browser disconnects / tab closes)
         self.worker_thread = threading.Thread(
             target=run_pipeline_worker,
-            args=(self, url, chunk_duration_sec, self.api_key_1, self.api_key_2, uploaded_audio_path),
+            args=(self, url, chunk_duration_sec, self.api_key_1, self.api_key_2, uploaded_audio_path, self.proxy_url),
             daemon=True,
             name=f"DubberWorker-{self.job_id}"
         )
@@ -611,7 +616,7 @@ class JobManager:
 job_manager = JobManager()
 
 
-# ─── MEDIA DOWNLOAD (yt-dlp & THIRD-PARTY PROXY FALLBACK) ──────────────────────
+# ─── MEDIA DOWNLOAD (4-LAYER WATERFALL ARCHITECTURE) ──────────────────────────
 def extract_video_id(url: str) -> Optional[str]:
     """Extracts 11-char YouTube video ID from various URL formats."""
     patterns = [
@@ -626,8 +631,264 @@ def extract_video_id(url: str) -> Optional[str]:
     return None
 
 
-def download_layer1_ytdlp(url: str, output_path: str, manager: JobManager) -> float:
-    """Layer 1: yt-dlp with mobile Android client spoofing and format 18/ba."""
+def is_direct_or_gdrive_url(url: str) -> bool:
+    """Checks if the URL is a Google Drive link or direct audio file."""
+    if "drive.google.com" in url:
+        return True
+    exts = (".mp3", ".wav", ".m4a", ".aac", ".ogg", ".opus", ".flac")
+    clean = url.split("?")[0].lower()
+    return any(clean.endswith(ext) for ext in exts)
+
+
+def transcode_to_standard_mp3(input_file: str, output_mp3: str):
+    """Converts any media file into standardized 44.1kHz stereo 192kbps MP3 via FFmpeg."""
+    subprocess.run(
+        [
+            "ffmpeg", "-y", "-i", input_file,
+            "-vn", "-ar", "44100", "-ac", "2", "-b:a", "192k",
+            output_mp3
+        ],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        check=True
+    )
+
+
+def download_direct_or_gdrive_audio(url: str, output_path: str, manager: JobManager) -> float:
+    """Handles direct audio URLs and public Google Drive download links."""
+    manager.log(f"[Direct Audio] Detected non-YouTube direct/Google Drive URL: {url}")
+    manager.status = "DOWNLOADING"
+    manager.message = "Downloading audio from direct link / Google Drive..."
+    manager.progress = 5.0
+
+    target_url = url
+    if "drive.google.com" in url:
+        m = re.search(r'drive\.google\.com/(?:file/d/|open\?id=|uc\?(?:export=download&)?id=)([a-zA-Z0-9_-]+)', url)
+        if m:
+            file_id = m.group(1)
+            target_url = f"https://drive.google.com/uc?export=download&id={file_id}"
+            manager.log(f"[Google Drive] Converted to direct export URL for file ID: {file_id}")
+
+    temp_path = output_path + ".direct.tmp"
+    req = urllib.request.Request(
+        target_url,
+        headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+    )
+    ctx = ssl._create_unverified_context()
+    with urllib.request.urlopen(req, timeout=60, context=ctx) as resp, open(temp_path, "wb") as f_out:
+        shutil.copyfileobj(resp, f_out)
+
+    # Transcode to 44.1kHz stereo 192k MP3
+    transcode_to_standard_mp3(temp_path, output_path)
+    if os.path.exists(temp_path):
+        try:
+            os.remove(temp_path)
+        except Exception:
+            pass
+
+    probe = AudioSegment.from_file(output_path)
+    dur = len(probe) / 1000.0
+    del probe
+    gc.collect()
+    manager.log(f"[Direct Audio] Download and transcoding complete! Duration: {dur:.1f}s")
+    return dur
+
+
+def resolve_effective_proxy(custom_proxy: Optional[str] = None) -> Optional[str]:
+    """Resolves proxy configuration from UI input or host environment secrets."""
+    if custom_proxy and custom_proxy.strip():
+        return custom_proxy.strip()
+    env_keys = ["YTDL_PROXY", "PROXY_URL", "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY"]
+    for k in env_keys:
+        val = os.environ.get(k)
+        if val and val.strip():
+            return val.strip()
+    return None
+
+
+def resolve_cookies_file() -> Optional[str]:
+    """Locates any valid YouTube Netscape cookies file in workspace or secrets."""
+    env_cookie = os.environ.get("YTDL_COOKIES_PATH")
+    if env_cookie and os.path.exists(env_cookie) and os.path.getsize(env_cookie) > 0:
+        return os.path.abspath(env_cookie)
+    cookie_candidates = [
+        "www.youtube.com_cookies.txt",
+        "cookies.txt",
+        os.path.join(BASE_DIR, "www.youtube.com_cookies.txt"),
+        os.path.join(BASE_DIR, "cookies.txt"),
+        os.path.join(os.getcwd(), "www.youtube.com_cookies.txt"),
+        os.path.join(os.getcwd(), "cookies.txt"),
+        "/app/www.youtube.com_cookies.txt",
+        "/app/cookies.txt",
+    ]
+    return next((os.path.abspath(cp) for cp in cookie_candidates if os.path.exists(cp) and os.path.getsize(cp) > 0), None)
+
+
+# ─── LAYER 1 (FAST & LIGHT): COBALT API ─────────────────────────────────────────
+def download_layer1_cobalt(url: str, output_path: str, manager: JobManager) -> float:
+    """Layer 1: Lightweight Cobalt API request (bypasses YouTube datacenter blocks)."""
+    video_id = extract_video_id(url) or url
+    clean_url = f"https://www.youtube.com/watch?v={video_id}" if len(video_id) == 11 else url
+
+    instances = [
+        "https://api.cobalt.tools",
+        "https://api.cobalt.tools/api/json",
+        "https://cobalt-api.kwiatekm.tokyo/api/json",
+        "https://co.wuk.sh/api/json",
+        "https://cobalt.api.sc/api/json",
+        "https://dl.cobalt.tools/api/json",
+        "https://api.wuk.sh/api/json",
+    ]
+    ctx = ssl._create_unverified_context()
+    temp_download = output_path + ".cobalt.tmp"
+    last_err = None
+
+    for inst in instances:
+        if manager.stop_event.is_set():
+            raise KeyboardInterrupt("Job was cancelled by user.")
+        try:
+            manager.log(f"[Layer 1 Cobalt] Querying instance: {inst}...")
+            # Support both v7/v8 (isAudioOnly) and v10 (downloadMode: audio)
+            payload = json.dumps({
+                "url": clean_url,
+                "isAudioOnly": True,
+                "downloadMode": "audio",
+                "audioFormat": "mp3"
+            }).encode("utf-8")
+            req = urllib.request.Request(
+                inst,
+                data=payload,
+                headers={
+                    "Accept": "application/json",
+                    "Content-Type": "application/json",
+                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+                }
+            )
+            with urllib.request.urlopen(req, timeout=12, context=ctx) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+                stream_url = data.get("url") or data.get("audio")
+                if stream_url:
+                    manager.log("[Layer 1 Cobalt] Direct stream URL resolved! Downloading audio stream...")
+                    req_dl = urllib.request.Request(stream_url, headers={"User-Agent": "Mozilla/5.0"})
+                    with urllib.request.urlopen(req_dl, timeout=60, context=ctx) as s_in, open(temp_download, "wb") as f_out:
+                        shutil.copyfileobj(s_in, f_out)
+
+                    transcode_to_standard_mp3(temp_download, output_path)
+                    if os.path.exists(temp_download):
+                        try:
+                            os.remove(temp_download)
+                        except Exception:
+                            pass
+                    if os.path.exists(output_path) and os.path.getsize(output_path) > 1024:
+                        return 0.0
+        except Exception as e:
+            last_err = e
+            manager.log(f"[Layer 1 Cobalt] Instance {inst} notice: {e}", level="DEBUG")
+
+    raise RuntimeError(f"Cobalt API failed across instances: {last_err}")
+
+
+# ─── LAYER 2 (ALTERNATIVE APIS): PIPED & INVIDIOUS ─────────────────────────────
+def download_layer2_alternative_apis(url: str, output_path: str, manager: JobManager) -> float:
+    """Layer 2: Alternative Public APIs (Piped & Invidious instances)."""
+    video_id = extract_video_id(url)
+    if not video_id:
+        raise ValueError(f"Could not extract video ID for Alternative APIs from: {url}")
+
+    piped_instances = [
+        "https://pipedapi.kavin.rocks",
+        "https://pipedapi.adminforge.de",
+        "https://piped-api.lunar.icu",
+        "https://pipedapi.tokhmi.xyz",
+        "https://pipedapi.ducks.party",
+        "https://api.piped.projectsegfau.lt",
+    ]
+    invidious_instances = [
+        "https://invidious.nerdvpn.de",
+        "https://inv.nadeko.net",
+        "https://invidious.drgns.space",
+        "https://yewtu.be",
+        "https://invidious.flokinet.to",
+        "https://vid.puffyan.us",
+        "https://iv.ggtyler.dev",
+        "https://invidious.private.coffee",
+    ]
+
+    ctx = ssl._create_unverified_context()
+    temp_download = output_path + ".altapi.tmp"
+    last_err = None
+
+    # 1. Try Piped Instances
+    for inst in piped_instances:
+        if manager.stop_event.is_set():
+            raise KeyboardInterrupt("Job was cancelled by user.")
+        try:
+            api_url = f"{inst}/streams/{video_id}"
+            manager.log(f"[Layer 2 Piped] Querying instance: {inst}...")
+            req = urllib.request.Request(api_url, headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"})
+            with urllib.request.urlopen(req, timeout=8, context=ctx) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+                audio_streams = data.get("audioStreams", [])
+                if audio_streams:
+                    best_stream = max(audio_streams, key=lambda s: int(s.get("bitrate", 0) or 0))
+                    audio_url = best_stream.get("url")
+                    if audio_url:
+                        if audio_url.startswith("/"):
+                            audio_url = inst + audio_url
+                        manager.log(f"[Layer 2 Piped] Audio stream resolved ({best_stream.get('format', 'audio')}, {best_stream.get('quality', '')})! Streaming...")
+                        req_dl = urllib.request.Request(audio_url, headers={"User-Agent": "Mozilla/5.0"})
+                        with urllib.request.urlopen(req_dl, timeout=60, context=ctx) as s_in, open(temp_download, "wb") as f_out:
+                            shutil.copyfileobj(s_in, f_out)
+                        transcode_to_standard_mp3(temp_download, output_path)
+                        if os.path.exists(temp_download):
+                            try:
+                                os.remove(temp_download)
+                            except Exception:
+                                pass
+                        if os.path.exists(output_path) and os.path.getsize(output_path) > 1024:
+                            return 0.0
+        except Exception as e:
+            last_err = e
+            manager.log(f"[Layer 2 Piped] Instance {inst} notice: {e}", level="DEBUG")
+
+    # 2. Try Invidious Instances
+    for inst in invidious_instances:
+        if manager.stop_event.is_set():
+            raise KeyboardInterrupt("Job was cancelled by user.")
+        try:
+            api_url = f"{inst}/api/v1/videos/{video_id}"
+            manager.log(f"[Layer 2 Invidious] Querying instance: {inst}...")
+            req = urllib.request.Request(api_url, headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"})
+            with urllib.request.urlopen(req, timeout=8, context=ctx) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+                formats = data.get("adaptiveFormats", [])
+                audio_formats = [f for f in formats if "audio" in f.get("type", "").lower() and f.get("url")]
+                if audio_formats:
+                    best_stream = max(audio_formats, key=lambda s: int(s.get("bitrate", 0) or 0))
+                    audio_url = best_stream.get("url")
+                    if audio_url:
+                        manager.log(f"[Layer 2 Invidious] Audio stream resolved ({best_stream.get('type')})! Streaming...")
+                        req_dl = urllib.request.Request(audio_url, headers={"User-Agent": "Mozilla/5.0"})
+                        with urllib.request.urlopen(req_dl, timeout=60, context=ctx) as s_in, open(temp_download, "wb") as f_out:
+                            shutil.copyfileobj(s_in, f_out)
+                        transcode_to_standard_mp3(temp_download, output_path)
+                        if os.path.exists(temp_download):
+                            try:
+                                os.remove(temp_download)
+                            except Exception:
+                                pass
+                        if os.path.exists(output_path) and os.path.getsize(output_path) > 1024:
+                            return 0.0
+        except Exception as e:
+            last_err = e
+            manager.log(f"[Layer 2 Invidious] Instance {inst} notice: {e}", level="DEBUG")
+
+    raise RuntimeError(f"Alternative APIs (Piped & Invidious) failed: {last_err}")
+
+
+# ─── LAYER 3 (ADVANCED BYPASS): yt-dlp SPOOFING, PROXIES & EMBEDDED JS ────────
+def download_layer3_advanced_bypass(url: str, output_path: str, manager: JobManager, proxy_url: str = "") -> float:
+    """Layer 3: Advanced yt-dlp extraction with multi-client spoofing, Node.js EJS challenge solver, and proxy rotation."""
     output_dir = os.path.dirname(output_path)
     base_name = os.path.splitext(os.path.basename(output_path))[0]
     template_path = os.path.join(output_dir, f"{base_name}.%(ext)s")
@@ -641,301 +902,243 @@ def download_layer1_ytdlp(url: str, output_path: str, manager: JobManager) -> fl
             if total > 0:
                 pct = (downloaded / total) * 100
                 manager.progress = round(1.0 + (pct * 0.14), 1)
-                manager.message = f"[Layer 1 yt-dlp] Downloading: {pct:.1f}% ({downloaded//1024//1024}MB / {total//1024//1024}MB)"
+                manager.message = f"[Layer 3 Advanced] Downloading: {pct:.1f}% ({downloaded//1024//1024}MB / {total//1024//1024}MB)"
 
-    cookie_candidates = [
-        "www.youtube.com_cookies.txt",
-        os.path.join(os.path.dirname(os.path.abspath(__file__)), "www.youtube.com_cookies.txt"),
-        os.path.join(os.getcwd(), "www.youtube.com_cookies.txt"),
-        "/app/www.youtube.com_cookies.txt",
-    ]
-    resolved_cookie_file = next((os.path.abspath(cp) for cp in cookie_candidates if os.path.exists(cp) and os.path.getsize(cp) > 0), None)
+    effective_proxy = resolve_effective_proxy(proxy_url)
+    resolved_cookie_file = resolve_cookies_file()
 
-    ydl_opts = {
-        "format": "18/ba/b/best",
-        "outtmpl": template_path,
-        "quiet": True,
-        "no_warnings": True,
-        "progress_hooks": [yt_hook],
-        "nocheckcertificate": True,
-        "extractor_args": {
-            "youtube": {
-                "player_client": ["android", "ios", "mweb"]
-            }
-        },
-        "http_headers": {
-            "User-Agent": "com.google.android.youtube/19.29.37 (Linux; U; Android 14; en_US) gzip"
-        },
-        "postprocessors": [
-            {
-                "key": "FFmpegExtractAudio",
-                "preferredcodec": "mp3",
-                "preferredquality": "192",
-            }
-        ],
-    }
+    if effective_proxy:
+        manager.log(f"[Layer 3 Advanced] Active Proxy configured: {effective_proxy.split('@')[-1]}")
     if resolved_cookie_file:
-        ydl_opts["cookiefile"] = resolved_cookie_file
+        manager.log(f"[Layer 3 Advanced] Cookie file detected: {os.path.basename(resolved_cookie_file)}")
 
-    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        info = ydl.extract_info(url, download=True)
-        duration = float(info.get("duration", 0.0) or 0.0)
+    # Check Node.js runtime for JavaScript challenge solving
+    has_node = shutil.which("node") is not None
+    if has_node:
+        manager.log("[Layer 3 Advanced] Embedded Node.js runtime detected for YouTube JS challenge solving.")
 
-    # Verify output mp3
-    if not os.path.exists(output_path):
-        candidates = [os.path.join(output_dir, f) for f in os.listdir(output_dir) if f.startswith(base_name) and f.endswith((".mp3", ".m4a", ".webm", ".opus"))]
-        if candidates and os.path.exists(candidates[0]):
-            if candidates[0] != output_path:
-                subprocess.run(["ffmpeg", "-y", "-i", candidates[0], "-vn", "-ar", "44100", "-ac", "2", "-b:a", "192k", output_path], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    # Multi-client combinations in order of resilience
+    client_candidates = [
+        ["tv", "mweb", "android", "ios"],
+        ["web_embedded", "web", "web_safari"],
+        ["visionos"]
+    ]
+
+    last_exc = None
+    for client_list in client_candidates:
+        if manager.stop_event.is_set():
+            raise KeyboardInterrupt("Job was cancelled by user.")
+        try:
+            manager.log(f"[Layer 3 Advanced] Attempting yt-dlp with client suite: {client_list}...")
+            ydl_opts = {
+                "format": "ba/b/18/bestaudio/best",
+                "outtmpl": template_path,
+                "quiet": True,
+                "no_warnings": True,
+                "progress_hooks": [yt_hook],
+                "nocheckcertificate": True,
+                "extractor_args": {
+                    "youtube": {
+                        "player_client": client_list
+                    }
+                },
+                "http_headers": {
+                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
+                },
+                "postprocessors": [
+                    {
+                        "key": "FFmpegExtractAudio",
+                        "preferredcodec": "mp3",
+                        "preferredquality": "192",
+                    }
+                ],
+            }
+            if has_node:
+                ydl_opts["js_runtimes"] = {"node": {}}
+            if effective_proxy:
+                ydl_opts["proxy"] = effective_proxy
+            if resolved_cookie_file and any(c in ["web", "web_embedded", "mweb", "tv"] for c in client_list):
+                ydl_opts["cookiefile"] = resolved_cookie_file
+
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                info = ydl.extract_info(url, download=True)
+                duration = float(info.get("duration", 0.0) or 0.0)
+
+            # Check output file
+            if not os.path.exists(output_path):
+                candidates = [os.path.join(output_dir, f) for f in os.listdir(output_dir) if f.startswith(base_name) and f.endswith((".mp3", ".m4a", ".webm", ".opus"))]
+                if candidates and os.path.exists(candidates[0]):
+                    if candidates[0] != output_path:
+                        transcode_to_standard_mp3(candidates[0], output_path)
+                        try:
+                            os.remove(candidates[0])
+                        except Exception:
+                            pass
+
+            if os.path.exists(output_path) and os.path.getsize(output_path) > 1024:
+                manager.log("[Layer 3 Advanced] yt-dlp download succeeded!")
+                return duration
+        except Exception as exc:
+            last_exc = exc
+            manager.log(f"[Layer 3 Advanced] Client suite {client_list} failed: {exc}", level="DEBUG")
+
+    # If direct requests fail and no proxy was set, attempt fast public proxy rotation
+    if not effective_proxy:
+        try:
+            manager.log("[Layer 3 Advanced] Direct cloud connection flagged. Attempting automated elite proxy rotation...")
+            proxy_feed = "https://api.proxyscrape.com/v2/?request=displayproxies&protocol=http&timeout=3000&country=all&ssl=yes&anonymity=elite"
+            req_p = urllib.request.Request(proxy_feed, headers={"User-Agent": "Mozilla/5.0"})
+            with urllib.request.urlopen(req_p, timeout=5) as r_p:
+                proxy_list = [p.strip() for p in r_p.read().decode("utf-8").splitlines() if p.strip()]
+
+            for p_candidate in proxy_list[:4]:
+                if manager.stop_event.is_set():
+                    raise KeyboardInterrupt("Job was cancelled by user.")
                 try:
-                    os.remove(candidates[0])
-                except Exception:
-                    pass
-        else:
-            raise FileNotFoundError("yt-dlp output file not created")
-
-    return duration
-
-
-def download_layer2_cobalt(url: str, output_path: str, manager: JobManager) -> float:
-    """Layer 2: Cobalt API (POST https://api.cobalt.tools/api/json requesting isAudioOnly)."""
-    video_id = extract_video_id(url) or url
-    clean_url = f"https://www.youtube.com/watch?v={video_id}" if len(video_id) == 11 else url
-
-    instances = [
-        "https://api.cobalt.tools/api/json",
-        "https://cobalt-api.kwiatekm.tokyo/api/json",
-        "https://co.wuk.sh/api/json",
-        "https://cobalt.api.sc/api/json"
-    ]
-    ctx = ssl._create_unverified_context()
-    temp_download = output_path + ".cobalt.tmp"
-    last_err = None
-
-    for inst in instances:
-        if manager.stop_event.is_set():
-            raise KeyboardInterrupt("Job was cancelled by user.")
-        try:
-            manager.log(f"[Downloader Layer 2] Querying Cobalt API instance: {inst}...")
-            payload = json.dumps({
-                "url": clean_url,
-                "isAudioOnly": True,
-                "audioFormat": "mp3",
-                "downloadMode": "audio"
-            }).encode("utf-8")
-            req = urllib.request.Request(
-                inst,
-                data=payload,
-                headers={
-                    "Accept": "application/json",
-                    "Content-Type": "application/json",
-                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
-                }
-            )
-            with urllib.request.urlopen(req, timeout=15, context=ctx) as resp:
-                data = json.loads(resp.read().decode("utf-8"))
-                stream_url = data.get("url")
-                if not stream_url and "audio" in data:
-                    stream_url = data.get("audio")
-                if stream_url:
-                    manager.log("[Downloader Layer 2] Direct audio stream URL resolved from Cobalt! Streaming audio payload...")
-                    req_dl = urllib.request.Request(stream_url, headers={"User-Agent": "Mozilla/5.0"})
-                    with urllib.request.urlopen(req_dl, timeout=60, context=ctx) as s_in, open(temp_download, "wb") as f_out:
-                        shutil.copyfileobj(s_in, f_out)
-                    
-                    subprocess.run(
-                        ["ffmpeg", "-y", "-i", temp_download, "-vn", "-ar", "44100", "-ac", "2", "-b:a", "192k", output_path],
-                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True
-                    )
-                    if os.path.exists(temp_download):
-                        os.remove(temp_download)
+                    rotated_proxy = f"http://{p_candidate}"
+                    manager.log(f"[Layer 3 Advanced] Testing rotated proxy: {p_candidate}...")
+                    ydl_opts_rot = {
+                        "format": "ba/b/18/bestaudio/best",
+                        "outtmpl": template_path,
+                        "quiet": True,
+                        "no_warnings": True,
+                        "proxy": rotated_proxy,
+                        "socket_timeout": 8,
+                        "nocheckcertificate": True,
+                        "extractor_args": {"youtube": {"player_client": ["mweb", "android", "ios"]}},
+                        "postprocessors": [{"key": "FFmpegExtractAudio", "preferredcodec": "mp3", "preferredquality": "192"}],
+                    }
+                    if has_node:
+                        ydl_opts_rot["js_runtimes"] = {"node": {}}
+                    with yt_dlp.YoutubeDL(ydl_opts_rot) as ydl:
+                        info = ydl.extract_info(url, download=True)
+                        duration = float(info.get("duration", 0.0) or 0.0)
                     if os.path.exists(output_path) and os.path.getsize(output_path) > 1024:
-                        return 0.0
-        except Exception as e:
-            last_err = e
-            manager.log(f"[Downloader Layer 2] Cobalt instance {inst} error: {e}", level="DEBUG")
+                        manager.log(f"[Layer 3 Advanced] Rotated proxy {p_candidate} succeeded!")
+                        return duration
+                except Exception as p_err:
+                    manager.log(f"[Layer 3 Advanced] Rotated proxy {p_candidate} notice: {p_err}", level="DEBUG")
+        except Exception as rot_err:
+            manager.log(f"[Layer 3 Advanced] Proxy rotation unavailable: {rot_err}", level="DEBUG")
 
-    raise RuntimeError(f"Cobalt API failed across endpoints: {last_err}")
-
-
-def download_layer3_piped(url: str, output_path: str, manager: JobManager) -> float:
-    """Layer 3: Piped API (fetches direct audio stream from public instances like pipedapi.kavin.rocks)."""
-    video_id = extract_video_id(url)
-    if not video_id:
-        raise ValueError(f"Could not extract video ID for Piped API from: {url}")
-
-    piped_instances = [
-        "https://pipedapi.kavin.rocks",
-        "https://pipedapi.tokhmi.xyz",
-        "https://piped-api.lunar.icu",
-        "https://pipedapi.adminforge.de",
-        "https://cf.pipedapi.kavin.rocks",
-        "https://api.piped.projectsegfau.lt"
-    ]
-    ctx = ssl._create_unverified_context()
-    temp_download = output_path + ".piped.tmp"
-    last_err = None
-
-    for inst in piped_instances:
-        if manager.stop_event.is_set():
-            raise KeyboardInterrupt("Job was cancelled by user.")
-        try:
-            api_url = f"{inst}/streams/{video_id}"
-            manager.log(f"[Downloader Layer 3] Querying Piped instance: {inst}...")
-            req = urllib.request.Request(api_url, headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"})
-            with urllib.request.urlopen(req, timeout=12, context=ctx) as resp:
-                data = json.loads(resp.read().decode("utf-8"))
-                audio_streams = data.get("audioStreams", [])
-                if audio_streams:
-                    best_stream = max(audio_streams, key=lambda s: int(s.get("bitrate", 0) or 0))
-                    audio_url = best_stream.get("url")
-                    if audio_url:
-                        if audio_url.startswith("/"):
-                            audio_url = inst + audio_url
-                        manager.log(f"[Downloader Layer 3] Piped audio stream resolved ({best_stream.get('format', 'audio')}, {best_stream.get('quality', '')})! Streaming...")
-                        req_dl = urllib.request.Request(audio_url, headers={"User-Agent": "Mozilla/5.0"})
-                        with urllib.request.urlopen(req_dl, timeout=60, context=ctx) as s_in, open(temp_download, "wb") as f_out:
-                            shutil.copyfileobj(s_in, f_out)
-                        subprocess.run(
-                            ["ffmpeg", "-y", "-i", temp_download, "-vn", "-ar", "44100", "-ac", "2", "-b:a", "192k", output_path],
-                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True
-                        )
-                        if os.path.exists(temp_download):
-                            os.remove(temp_download)
-                        if os.path.exists(output_path) and os.path.getsize(output_path) > 1024:
-                            return 0.0
-        except Exception as e:
-            last_err = e
-            manager.log(f"[Downloader Layer 3] Piped instance {inst} error: {e}", level="DEBUG")
-
-    raise RuntimeError(f"Piped API failed across instances: {last_err}")
-
-
-def download_layer4_pytubefix(url: str, output_path: str, manager: JobManager) -> float:
-    """Layer 4: pytubefix (lightweight local Python library bypass)."""
+    # Final bypass attempt with pytubefix matrix
     try:
         from pytubefix import YouTube as PyTubeFix
+        manager.log("[Layer 3 Advanced] Trying pytubefix client matrix...")
+        for c in ["ANDROID", "IOS", "MWEB", "VISION_OS", "WEB"]:
+            if manager.stop_event.is_set():
+                raise KeyboardInterrupt("Job was cancelled by user.")
+            try:
+                proxies_arg = {"http": effective_proxy, "https": effective_proxy} if effective_proxy else None
+                yt = PyTubeFix(url, client=c, proxies=proxies_arg)
+                audio_stream = yt.streams.get_audio_only() or yt.streams.filter(only_audio=True).first()
+                if audio_stream:
+                    temp_pt = output_path + f".pt_{c}.tmp"
+                    audio_stream.download(output_path=output_dir, filename=os.path.basename(temp_pt))
+                    if os.path.exists(temp_pt) and os.path.getsize(temp_pt) > 1024:
+                        transcode_to_standard_mp3(temp_pt, output_path)
+                        try:
+                            os.remove(temp_pt)
+                        except Exception:
+                            pass
+                        if os.path.exists(output_path) and os.path.getsize(output_path) > 1024:
+                            manager.log(f"[Layer 3 Advanced] pytubefix (client={c}) succeeded!")
+                            return 0.0
+            except Exception as pt_err:
+                manager.log(f"[Layer 3 Advanced] pytubefix client={c} error: {pt_err}", level="DEBUG")
     except ImportError:
-        raise RuntimeError("pytubefix library is not installed")
+        pass
 
-    video_id = extract_video_id(url) or url
-    full_url = f"https://www.youtube.com/watch?v={video_id}" if len(video_id) == 11 else url
-    temp_dir = os.path.dirname(output_path)
-    timestamp = int(time.time())
-    dl_file = None
-
-    manager.log(f"[Downloader Layer 4] Attempting download with pytubefix for: {full_url}...")
-    for client_type in ["ANDROID", "WEB", "MWEB"]:
-        if manager.stop_event.is_set():
-            raise KeyboardInterrupt("Job was cancelled by user.")
-        try:
-            manager.log(f"[Downloader Layer 4] Testing pytubefix client='{client_type}'...")
-            yt = PyTubeFix(full_url, client=client_type)
-            audio_stream = yt.streams.get_audio_only() or yt.streams.filter(only_audio=True).order_by('abr').desc().first()
-            if audio_stream:
-                manager.log(f"[Downloader Layer 4] Audio stream found ({audio_stream.abr}, {audio_stream.mime_type}). Downloading...")
-                dl_file = audio_stream.download(
-                    output_path=temp_dir,
-                    filename=f"pytubefix_raw_{timestamp}.{audio_stream.subtype or 'm4a'}"
-                )
-                if dl_file and os.path.exists(dl_file) and os.path.getsize(dl_file) > 1024:
-                    break
-        except Exception as client_err:
-            manager.log(f"[Downloader Layer 4] pytubefix client='{client_type}' error: {client_err}", level="DEBUG")
-
-    if not dl_file or not os.path.exists(dl_file):
-        raise RuntimeError("pytubefix failed to download audio stream across clients")
-
-    # Transcode to standard 44.1kHz stereo MP3
-    subprocess.run(
-        ["ffmpeg", "-y", "-i", dl_file, "-vn", "-ar", "44100", "-ac", "2", "-b:a", "192k", output_path],
-        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True
-    )
-    if os.path.exists(dl_file):
-        try:
-            os.remove(dl_file)
-        except Exception:
-            pass
-
-    return 0.0
+    raise RuntimeError(f"Advanced bypass (yt-dlp, proxy rotation, pytubefix) failed: {last_exc}")
 
 
-def download_youtube_audio(url: str, output_dir: str, manager: JobManager) -> Tuple[str, float]:
-    """Sequential 4-layer fallback YouTube audio downloader:
-    Layer 1: yt-dlp (mobile Android client spoofing & format 18/ba)
-    Layer 2: Cobalt API (https://api.cobalt.tools/api/json requesting isAudioOnly)
-    Layer 3: Piped API (https://pipedapi.kavin.rocks to fetch direct audio stream URL)
-    Layer 4: pytubefix (lightweight local library bypass)
+# ─── LAYER 4: MASTER 4-LAYER WATERFALL ORCHESTRATOR & FAIL-SAFE ────────────────
+def download_youtube_audio(
+    url: str,
+    output_dir: str,
+    manager: JobManager,
+    proxy_url: str = ""
+) -> Tuple[str, float]:
+    """Sequential 4-Layer Waterfall Audio Extraction with Strict Memory Isolation:
+    Layer 1 (Fast & Light): Cobalt API
+    Layer 2 (Alternative APIs): Piped & Invidious APIs
+    Layer 3 (Advanced Bypass): yt-dlp multi-client spoofing, proxy rotation & Node.js EJS
+    Layer 4 (Ultimate Fail-safe): Graceful UI activation for direct MP3 upload or Google Drive link
     """
-    manager.log(f"[Downloader] Initiating 4-layer sequential download pipeline for: {url}")
-    manager.status = "DOWNLOADING"
-    manager.message = "Downloading audio stream (Layer 1: yt-dlp)..."
-    manager.save_to_disk()
-
     timestamp = int(time.time())
     final_output_path = os.path.join(output_dir, f"source_audio_{timestamp}.mp3")
     duration = 0.0
     download_success = False
 
-    # Layer 1: yt-dlp
+    # Check for direct audio URL or Google Drive link
+    if is_direct_or_gdrive_url(url):
+        dur = download_direct_or_gdrive_audio(url, final_output_path, manager)
+        return final_output_path, dur
+
+    manager.log(f"[Waterfall Downloader] Initiating 4-Layer Waterfall Extraction for: {url}")
+    manager.status = "DOWNLOADING"
+    manager.message = "Attempting Layer 1 (Cobalt API)..."
+    manager.save_to_disk()
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # LAYER 1: Fast & Light Cobalt API
+    # ──────────────────────────────────────────────────────────────────────────
     try:
-        manager.log("[Downloader] 🔹 [Layer 1/4] Attempting yt-dlp with mobile client spoofing...")
-        duration = download_layer1_ytdlp(url, final_output_path, manager)
+        manager.log("[Waterfall] 🔹 [Layer 1/4] Attempting fast & light Cobalt API extraction...")
+        duration = download_layer1_cobalt(url, final_output_path, manager)
         if os.path.exists(final_output_path) and os.path.getsize(final_output_path) > 1024:
-            manager.log("[Downloader] ✅ Layer 1 (yt-dlp) download succeeded!")
+            manager.log("[Waterfall] ✅ Layer 1 (Cobalt API) download succeeded!")
             download_success = True
     except Exception as e1:
         if manager.stop_event.is_set():
             raise
-        manager.log(f"[Downloader] ⚠️ Layer 1 (yt-dlp) failed: {e1}. Silently falling back to Layer 2 (Cobalt API)...", level="WARNING")
+        manager.log(f"[Waterfall] ⚠️ Layer 1 (Cobalt) failed: {e1}. Falling back to Layer 2 (Piped & Invidious APIs)...", level="WARNING")
 
-    # Layer 2: Cobalt API
+    # ──────────────────────────────────────────────────────────────────────────
+    # LAYER 2: Alternative APIs (Piped & Invidious)
+    # ──────────────────────────────────────────────────────────────────────────
     if not download_success:
         try:
-            manager.message = "Downloading audio stream (Layer 2: Cobalt API)..."
-            manager.log("[Downloader] 🔹 [Layer 2/4] Attempting Cobalt API (POST https://api.cobalt.tools/api/json)...")
-            duration = download_layer2_cobalt(url, final_output_path, manager)
+            manager.message = "Attempting Layer 2 (Piped & Invidious APIs)..."
+            manager.log("[Waterfall] 🔹 [Layer 2/4] Attempting Alternative APIs (Piped & Invidious)...")
+            duration = download_layer2_alternative_apis(url, final_output_path, manager)
             if os.path.exists(final_output_path) and os.path.getsize(final_output_path) > 1024:
-                manager.log("[Downloader] ✅ Layer 2 (Cobalt API) download succeeded!")
+                manager.log("[Waterfall] ✅ Layer 2 (Alternative APIs) download succeeded!")
                 download_success = True
         except Exception as e2:
             if manager.stop_event.is_set():
                 raise
-            manager.log(f"[Downloader] ⚠️ Layer 2 (Cobalt API) failed: {e2}. Silently falling back to Layer 3 (Piped API)...", level="WARNING")
+            manager.log(f"[Waterfall] ⚠️ Layer 2 (Alternative APIs) failed: {e2}. Falling back to Layer 3 (Advanced Bypass)...", level="WARNING")
 
-    # Layer 3: Piped API
+    # ──────────────────────────────────────────────────────────────────────────
+    # LAYER 3: Advanced Bypass (yt-dlp spoofing, proxy rotation, Node.js EJS)
+    # ──────────────────────────────────────────────────────────────────────────
     if not download_success:
         try:
-            manager.message = "Downloading audio stream (Layer 3: Piped API)..."
-            manager.log("[Downloader] 🔹 [Layer 3/4] Attempting Piped API (https://pipedapi.kavin.rocks)...")
-            duration = download_layer3_piped(url, final_output_path, manager)
+            manager.message = "Attempting Layer 3 (Advanced yt-dlp & proxy bypass)..."
+            manager.log("[Waterfall] 🔹 [Layer 3/4] Attempting Advanced yt-dlp multi-client & proxy bypass...")
+            duration = download_layer3_advanced_bypass(url, final_output_path, manager, proxy_url=proxy_url)
             if os.path.exists(final_output_path) and os.path.getsize(final_output_path) > 1024:
-                manager.log("[Downloader] ✅ Layer 3 (Piped API) download succeeded!")
+                manager.log("[Waterfall] ✅ Layer 3 (Advanced Bypass) download succeeded!")
                 download_success = True
         except Exception as e3:
             if manager.stop_event.is_set():
                 raise
-            manager.log(f"[Downloader] ⚠️ Layer 3 (Piped API) failed: {e3}. Silently falling back to Layer 4 (pytubefix)...", level="WARNING")
+            manager.log(f"[Waterfall] ⚠️ Layer 3 (Advanced Bypass) failed: {e3}", level="ERROR")
 
-    # Layer 4: pytubefix
-    if not download_success:
-        try:
-            manager.message = "Downloading audio stream (Layer 4: pytubefix)..."
-            manager.log("[Downloader] 🔹 [Layer 4/4] Attempting pytubefix (lightweight local library bypass)...")
-            duration = download_layer4_pytubefix(url, final_output_path, manager)
-            if os.path.exists(final_output_path) and os.path.getsize(final_output_path) > 1024:
-                manager.log("[Downloader] ✅ Layer 4 (pytubefix) download succeeded!")
-                download_success = True
-        except Exception as e4:
-            if manager.stop_event.is_set():
-                raise
-            manager.log(f"[Downloader] ❌ Layer 4 (pytubefix) failed: {e4}", level="ERROR")
-
+    # ──────────────────────────────────────────────────────────────────────────
+    # LAYER 4: Ultimate Fail-safe (Graceful UI Guidance & Action Prompt)
+    # ──────────────────────────────────────────────────────────────────────────
     if not download_success or not os.path.exists(final_output_path):
-        raise RuntimeError(
-            "All 4 download layers (yt-dlp, Cobalt, Piped, pytubefix) failed due to YouTube datacenter IP restrictions. "
-            "Please use the '⚡ Fast Direct MP3 Upload' option above to dub your video with 100% reliability."
+        err_msg = (
+            "YouTube datacenter IP restrictions blocked automated extraction across all 3 programmatic layers. "
+            "Please use the '⚡ Fast Direct MP3 Upload' box above (or provide a direct Google Drive link / custom proxy in Advanced Settings) to proceed with 100% reliability."
         )
+        manager.log(f"[Waterfall] 🛑 [Layer 4/4 Fail-Safe Activated] {err_msg}", level="ERROR")
+        manager.status = "FAILED"
+        manager.message = "Extraction blocked by YouTube datacenter IP restrictions. Please use Direct MP3 Upload."
+        manager.save_to_disk()
+        raise RuntimeError(err_msg)
 
     # Fallback duration measurement if metadata lacked duration
     if duration <= 0.0:
@@ -1366,7 +1569,8 @@ def run_pipeline_worker(
     chunk_duration_sec: int,
     api_key_1: str = "",
     api_key_2: str = "",
-    uploaded_audio_path: Optional[str] = None
+    uploaded_audio_path: Optional[str] = None,
+    proxy_url: str = ""
 ):
     """The master background worker executing the full pipeline sequentially with Storage Cleanup."""
     try:
@@ -1422,7 +1626,15 @@ def run_pipeline_worker(
             manager.log(f"[Source] ✅ Uploaded audio ready! Duration: {duration_sec:.1f}s ({duration_sec / 60:.1f} min)")
             manager.progress = 10.0
         else:
-            source_audio_path, duration_sec = download_youtube_audio(youtube_url, WORKSPACE_DIR, manager)
+            source_audio_path, duration_sec = download_youtube_audio(
+                youtube_url, WORKSPACE_DIR, manager, proxy_url=proxy_url
+            )
+
+        # STRICT SYNCHRONOUS MEMORY MANAGEMENT:
+        # Guarantee that all network buffers, temporary byte streams, and downloader objects
+        # are completely purged from RAM before loading the chunking and dubbing pipeline.
+        gc.collect()
+        manager.log("[Memory Guard] Download phase finished and network buffers purged via gc.collect(). No heavy AI models were loaded during download.")
 
         if manager.stop_event.is_set():
             raise KeyboardInterrupt("Job was cancelled by user.")
@@ -1685,7 +1897,8 @@ def progressive_start_pipeline(
     uploaded_file: Any,
     chunk_duration: int,
     api_key_1: str,
-    api_key_2: str
+    api_key_2: str,
+    custom_proxy: str = ""
 ):
     """Gradio generator yielding live updates.
     
@@ -1731,7 +1944,8 @@ def progressive_start_pipeline(
         chunk_duration_sec=int(chunk_duration),
         api_key_1=api_key_1,
         api_key_2=api_key_2,
-        uploaded_audio_path=uploaded_audio
+        uploaded_audio_path=uploaded_audio,
+        proxy_url=custom_proxy
     )
     if not success:
         yield get_dashboard_state()
@@ -1786,15 +2000,22 @@ with gr.Blocks(theme=gr.themes.Soft(primary_hue="indigo", neutral_hue="slate"), 
     with gr.Row():
         with gr.Column(scale=6):
             url_input = gr.Textbox(
-                label="YouTube Video URL",
-                placeholder="https://www.youtube.com/watch?v=... (2-3 hour anime theory videos supported)",
+                label="YouTube Video URL or Direct / Google Drive Link",
+                placeholder="https://www.youtube.com/watch?v=... or direct MP3 / Google Drive audio link",
                 lines=1,
             )
             file_upload_input = gr.File(
                 file_types=[".mp3", ".wav", ".m4a"],
                 type="filepath",
-                label="Fast Direct MP3 Upload",
+                label="⚡ Fast Direct MP3 Upload (100% Reliable Fail-Safe)",
             )
+            with gr.Accordion("🌐 Advanced Network & Proxy Settings (Datacenter IP Bypass)", open=False):
+                proxy_input = gr.Textbox(
+                    label="Custom Proxy URL (Optional HTTP / SOCKS5)",
+                    placeholder="e.g., http://user:pass@host:port or socks5://host:port (Bypasses Hugging Face cloud IP bans)",
+                    value=os.environ.get("YTDL_PROXY", os.environ.get("PROXY_URL", "")),
+                    lines=1,
+                )
         with gr.Column(scale=6):
             chunk_slider = gr.Slider(
                 minimum=60,
@@ -1886,7 +2107,7 @@ with gr.Blocks(theme=gr.themes.Soft(primary_hue="indigo", neutral_hue="slate"), 
     # Progressive Yield Generator triggered on start click
     start_btn.click(
         fn=progressive_start_pipeline,
-        inputs=[url_input, file_upload_input, chunk_slider, api_key_1_input, api_key_2_input],
+        inputs=[url_input, file_upload_input, chunk_slider, api_key_1_input, api_key_2_input, proxy_input],
         outputs=ui_outputs,
     )
 

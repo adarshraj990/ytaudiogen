@@ -3,9 +3,8 @@
 #  Fast Direct Media Dubber (English to Hindi, Spanish, French, Portuguese)
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-# Local GGUF LLM Engine: Prebuilt binary wheel for Linux avoids slow C++ source compilation
-llama-cpp-python @ https://github.com/abetlen/llama-cpp-python/releases/download/v0.3.35/llama_cpp_python-0.3.35-py3-none-manylinux2014_x86_64.manylinux_2_17_x86_64.whl ; sys_platform == 'linux'
-llama-cpp-python ; sys_platform != 'linux'
+# Groq High-Speed Cloud LLM Engine
+groq>=0.9.0
 
 # Lazy-Loaded TTS Engines & Transformers (Capped <4.45.0 to avoid pip backtracking with huggingface_hub<1.0.0)
 transformers>=4.40.0,<4.45.0

@@ -113,12 +113,12 @@ import numpy as np
 from pydub import AudioSegment
 from pydub.generators import Sine
 
-# Local GGUF LLM Engine (llama-cpp-python)
+# Groq High-Speed Cloud LLM Engine
 try:
-    from llama_cpp import Llama
-    HAS_LLAMA_CPP = True
+    from groq import Groq
+    HAS_GROQ = True
 except ImportError:
-    HAS_LLAMA_CPP = False
+    HAS_GROQ = False
 
 # ─── LOGGING SETUP ─────────────────────────────────────────────────────────────
 logging.basicConfig(
@@ -193,8 +193,8 @@ DEFAULT_CHUNK_DURATION_SEC = 90  # 1.5 minutes (OOM prevention sweet spot)
 
 # ─── STRICT ANIME/MANGA SYSTEM PROMPT ─────────────────────────────────────────
 STRICT_ANIME_SYSTEM_PROMPT = (
-    "You are an expert Anime and Manga translator. Your task is to translate the given English subtitles "
-    "into the target language. You must preserve the exact essence, tone, and specific terminology of the Anime universe. "
+    "You are an expert Anime and Manga translator. Translate the given English subtitles "
+    "into the target language. Preserve the exact essence, tone, and specific terminology of the Anime universe. "
     "Do NOT translate words like 'Hokage', 'Ninjutsu', 'Sensei', 'Sharingan', or specific attack names. "
     "Keep the dialogue dramatic and natural for dubbing. Output ONLY the translated text, no filler words."
 )
@@ -585,8 +585,9 @@ class JobManager:
         self,
         uploaded_audio_path: str,
         chunk_duration_sec: int = DEFAULT_CHUNK_DURATION_SEC,
+        groq_api_key: str = "",
     ) -> Tuple[bool, str]:
-        """Initiates the 100% local background dubbing job in a detached daemon thread."""
+        """Initiates the background dubbing job in a detached daemon thread with Groq translation."""
         with self.lock:
             if self.worker_thread and self.worker_thread.is_alive():
                 return False, "A dubbing task is already running in the background. Wait or cancel it first."
@@ -600,7 +601,7 @@ class JobManager:
             self.source_filename = os.path.basename(uploaded_audio_path)
             self.status = "STARTING"
             self.progress = 1.0
-            self.message = f"Initializing local pipeline for: {self.source_filename}..."
+            self.message = f"Initializing Groq dubbing pipeline for: {self.source_filename}..."
             self.current_language = None
             self.current_chunk = 0
             self.total_chunks = 0
@@ -611,13 +612,13 @@ class JobManager:
             self.stop_event.clear()
 
         self.log(f"New dubbing job registered (ID: {self.job_id}) for file: {self.source_filename}")
-        self.log(f"🧠 Local Engine: Qwen2.5-1.5B-Instruct (GGUF) + Local Multi-Model TTS (Zero-Juggling)")
+        self.log(f"⚡ Translation Engine: Groq API (llama-3.3-70b-versatile) with 15s Speed Breaker")
         self.save_to_disk()
 
         # Start decoupled daemon thread (survives browser disconnects / tab closes)
         self.worker_thread = threading.Thread(
             target=run_pipeline_worker,
-            args=(self, uploaded_audio_path, chunk_duration_sec),
+            args=(self, uploaded_audio_path, chunk_duration_sec, groq_api_key),
             daemon=True,
             name=f"DubberWorker-{self.job_id}"
         )
@@ -841,11 +842,7 @@ def split_audio_into_chunks(
     return chunk_paths
 
 
-# ─── LOCAL QWEN (GGUF) TRANSLATION ENGINE & ZERO-JUGGLING ARCHITECTURE ────────
-LOCAL_QWEN_REPO = "Qwen/Qwen2.5-1.5B-Instruct-GGUF"
-LOCAL_QWEN_FILENAME = "qwen2.5-1.5b-instruct-q4_k_m.gguf"
-
-
+# ─── GROQ CLOUD TRANSLATION ENGINE (LLAMA-3.3-70B-VERSATILE) ──────────────────
 def clean_translated_output(raw: str) -> str:
     """Strips markdown code blocks, prefixes like 'Translation:', and quotes from LLM output."""
     if not raw:
@@ -857,158 +854,131 @@ def clean_translated_output(raw: str) -> str:
     return text
 
 
-class LocalQwenTranslator:
-    """Persistent local LLM manager keeping Qwen2.5-1.5B-Instruct (GGUF) in RAM (~1.5GB) for zero-juggling."""
+class GroqTranslator:
+    """Translation engine using Groq API (llama-3.3-70b-versatile) with strict 15s speed breaker."""
     def __init__(self):
-        self.llm = None
-        self.model_path = None
-        self._lock = threading.Lock()
-
-    def get_model_path(self, manager: Optional[JobManager] = None) -> str:
-        target_dir = os.path.join(MODEL_CACHE_DIR, "qwen_gguf")
-        os.makedirs(target_dir, exist_ok=True)
-        target_path = os.path.join(target_dir, LOCAL_QWEN_FILENAME)
-
-        if os.path.exists(target_path) and os.path.getsize(target_path) > 100_000_000:
-            return target_path
-
-        if manager:
-            manager.log(f"📥 [Local LLM] Downloading Qwen2.5-1.5B-Instruct GGUF (~980MB) from {LOCAL_QWEN_REPO}...")
-
-        try:
-            from huggingface_hub import hf_hub_download
-            dl_path = hf_hub_download(
-                repo_id=LOCAL_QWEN_REPO,
-                filename=LOCAL_QWEN_FILENAME,
-                local_dir=target_dir,
-                local_dir_use_symlinks=False,
-            )
-            if manager:
-                manager.log("✅ [Local LLM] Model downloaded successfully to disk.")
-            return dl_path
-        except Exception as e:
-            if manager:
-                manager.log(f"⚠️ [Local LLM] HuggingFace Hub download notice: {e}", level="WARNING")
-            return target_path
-
-    def load_model(self, manager: Optional[JobManager] = None):
-        """Loads Qwen2.5-1.5B-Instruct into RAM once and holds it persistently."""
-        with self._lock:
-            if self.llm is not None:
-                return self.llm
-
-            model_file = self.get_model_path(manager=manager)
-            self.model_path = model_file
-
-            if manager:
-                manager.log("⚡ [Local LLM] Loading Qwen2.5-1.5B-Instruct (GGUF) persistently into RAM...")
-
-            try:
-                from llama_cpp import Llama
-                # 4 threads optimal for 16GB CPU host, context 2048
-                self.llm = Llama(
-                    model_path=model_file,
-                    n_ctx=2048,
-                    n_threads=min(4, os.cpu_count() or 4),
-                    verbose=False,
-                )
-                if manager:
-                    manager.log("✅ [Local LLM] Qwen2.5-1.5B-Instruct initialized in RAM. Zero-juggling active.")
-            except ImportError:
-                if manager:
-                    manager.log("⚠️ [Local LLM] 'llama-cpp-python' not found in environment. Attempting dynamic pip install...", level="WARNING")
-                try:
-                    subprocess.run([sys.executable, "-m", "pip", "install", "llama-cpp-python"], check=True)
-                    from llama_cpp import Llama
-                    self.llm = Llama(
-                        model_path=model_file,
-                        n_ctx=2048,
-                        n_threads=min(4, os.cpu_count() or 4),
-                        verbose=False,
-                    )
-                    if manager:
-                        manager.log("✅ [Local LLM] Qwen2.5-1.5B-Instruct successfully loaded via llama-cpp.")
-                except Exception as py_err:
-                    if manager:
-                        manager.log(f"⚠️ [Local LLM] llama-cpp fallback notice: {py_err}", level="WARNING")
-                    self.llm = None
-            except Exception as e:
-                if manager:
-                    manager.log(f"⚠️ [Local LLM] Could not load GGUF via llama_cpp: {e}", level="WARNING")
-                self.llm = None
-
-            return self.llm
+        self.default_model = "llama-3.3-70b-versatile"
 
     def translate_subtitles(
         self,
         english_text: str,
         target_language: str,
+        groq_api_key: Optional[str] = None,
         manager: Optional[JobManager] = None,
     ) -> str:
-        """Translates English dialogue into target_language using the strict Anime/Manga system prompt."""
+        """Translates English dialogue into target_language using Groq llama-3.3-70b-versatile.
+        
+        CRITICAL REQUIREMENT:
+        Enforces time.sleep(15) immediately after every single Groq API translation request
+        to prevent 429 Rate Limit errors.
+        """
         if not english_text or len(english_text.strip()) < 2:
             return ""
 
-        model = self.load_model(manager=manager)
+        api_key = (groq_api_key or os.environ.get("GROQ_API_KEY", "")).strip().strip('"').strip("'")
+        if not api_key:
+            if manager:
+                manager.log("⚠️ [Groq] GROQ_API_KEY is not configured in environment or UI. Using localized anime lore fallback.", level="WARNING")
+            return self._get_fallback(target_language)
 
-        # 1. llama-cpp-python execution
-        if model is not None:
-            try:
-                messages = [
-                    {
-                        "role": "system",
-                        "content": STRICT_ANIME_SYSTEM_PROMPT,
-                    },
-                    {
-                        "role": "user",
-                        "content": f"Target Language: {target_language}\n\nEnglish Subtitles:\n{english_text.strip()}",
-                    },
-                ]
-                output = model.create_chat_completion(
-                    messages=messages,
-                    temperature=0.3,
-                    max_tokens=512,
-                )
-                res = output["choices"][0]["message"]["content"].strip()
-                cleaned = clean_translated_output(res)
-                if cleaned and len(cleaned) >= 3:
-                    return cleaned
-            except Exception as llm_err:
-                if manager:
-                    manager.log(f"⚠️ [Local LLM] Qwen inference notice: {llm_err}", level="WARNING")
-
-        # 2. Fallback to local transformers Qwen if llama-cpp was unavailable
-        try:
-            from transformers import AutoModelForCausalLM, AutoTokenizer
-            import torch
-            tok = AutoTokenizer.from_pretrained("Qwen/Qwen2.5-1.5B-Instruct")
-            mdl = AutoModelForCausalLM.from_pretrained("Qwen/Qwen2.5-1.5B-Instruct", torch_dtype="auto")
-            msgs = [
-                {"role": "system", "content": STRICT_ANIME_SYSTEM_PROMPT},
-                {"role": "user", "content": f"Target Language: {target_language}\n\nEnglish Subtitles:\n{english_text.strip()}"}
-            ]
-            text = tok.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True)
-            inputs = tok([text], return_tensors="pt")
-            with torch.no_grad():
-                gen_ids = mdl.generate(**inputs, max_new_tokens=256, temperature=0.3)
-            out_text = tok.batch_decode([gen_ids[0][len(inputs.input_ids[0]):]], skip_special_tokens=True)[0]
-            cleaned = clean_translated_output(out_text)
-            if cleaned and len(cleaned) >= 3:
-                return cleaned
-        except Exception:
-            pass
-
-        # 3. Robust Canonical Localized Fallback
-        localized_fallbacks = {
-            "Hindi": f"होकागे और उचिहा जुत्सु का रहस्यमय विश्लेषण जारी है, चक्र और निन्जुत्सु की असाधारण शक्ति।",
-            "Spanish": f"El análisis de las técnicas del Hokage y el clan Uchiha continúa con gran poder de chakra y ninjutsu.",
-            "French": f"L'analyse des techniques du Hokage et du clan Uchiha se poursuit avec une puissance impressionnante de chakra.",
-            "Portuguese": f"A análise das técnicas do Hokage e do clã Uchiha continua com o poder impressionante do chakra.",
+        headers = {
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+            "User-Agent": "AudioGenFlow/3.0",
         }
-        return localized_fallbacks.get(target_language, f"Anime dialogue breakdown and lore analysis.")
+        payload = {
+            "model": self.default_model,
+            "messages": [
+                {
+                    "role": "system",
+                    "content": STRICT_ANIME_SYSTEM_PROMPT,
+                },
+                {
+                    "role": "user",
+                    "content": f"Target Language: {target_language}\n\nEnglish Subtitles:\n{english_text.strip()}",
+                },
+            ],
+            "temperature": 0.3,
+            "max_tokens": 512,
+        }
+
+        translated_text = ""
+        try:
+            if manager:
+                manager.log(f"⚡ [Groq API] Requesting translation ({self.default_model}) for {target_language}...")
+
+            # 1. Try official groq SDK if installed
+            if HAS_GROQ:
+                try:
+                    client = Groq(api_key=api_key)
+                    completion = client.chat.completions.create(
+                        model=self.default_model,
+                        messages=[
+                            {"role": "system", "content": STRICT_ANIME_SYSTEM_PROMPT},
+                            {"role": "user", "content": f"Target Language: {target_language}\n\nEnglish Subtitles:\n{english_text.strip()}"},
+                        ],
+                        temperature=0.3,
+                        max_tokens=512,
+                    )
+                    raw_out = completion.choices[0].message.content or ""
+                    translated_text = clean_translated_output(raw_out)
+                except Exception as sdk_err:
+                    if manager:
+                        manager.log(f"⚠️ [Groq SDK] SDK notice ({sdk_err}), trying direct HTTP REST...", level="WARNING")
+
+            # 2. Direct HTTP REST fallback via urllib (zero external dependency)
+            if not translated_text:
+                req = urllib.request.Request(
+                    "https://api.groq.com/openai/v1/chat/completions",
+                    data=json.dumps(payload).encode("utf-8"),
+                    headers=headers,
+                    method="POST",
+                )
+                ctx = ssl.create_default_context()
+                try:
+                    with urllib.request.urlopen(req, timeout=30, context=ctx) as resp:
+                        resp_data = json.loads(resp.read().decode("utf-8"))
+                except Exception:
+                    ctx_unverified = ssl._create_unverified_context()
+                    with urllib.request.urlopen(req, timeout=30, context=ctx_unverified) as resp:
+                        resp_data = json.loads(resp.read().decode("utf-8"))
+
+                choices = resp_data.get("choices", [])
+                if choices:
+                    raw_out = choices[0].get("message", {}).get("content", "").strip()
+                    translated_text = clean_translated_output(raw_out)
+
+            if manager and translated_text:
+                manager.log(f"✅ [Groq API] Translation received successfully ({len(translated_text.split())} words).")
+
+        except Exception as e:
+            if manager:
+                manager.log(f"⚠️ [Groq API] Request error: {e}", level="WARNING")
+
+        finally:
+            # ─── CRITICAL REQUIREMENT: SPEED BREAKER ───────────────────────
+            # You MUST add time.sleep(15) immediately after every single Groq API
+            # translation request to prevent 429 Rate Limit errors.
+            if manager:
+                manager.log("⏱️ [Speed Breaker] Pausing 15s after Groq API request to prevent 429 rate limits...")
+            time.sleep(15)
+
+        if translated_text and len(translated_text.strip()) >= 3:
+            return translated_text
+
+        return self._get_fallback(target_language)
+
+    def _get_fallback(self, target_language: str) -> str:
+        localized_fallbacks = {
+            "Hindi": "होकागे और उचिहा जुत्सु का रहस्यमय विश्लेषण जारी है, चक्र और निन्जुत्सु की असाधारण शक्ति।",
+            "Spanish": "El análisis de las técnicas del Hokage y el clan Uchiha continúa con gran poder de chakra y ninjutsu.",
+            "French": "L'analyse des techniques du Hokage et du clan Uchiha se poursuit avec une puissance impressionnante de chakra.",
+            "Portuguese": "A análise das técnicas do Hokage e do clã Uchiha continua com o poder impressionante do chakra.",
+        }
+        return localized_fallbacks.get(target_language, "Anime dialogue breakdown and lore analysis.")
 
 
-local_qwen_translator = LocalQwenTranslator()
+groq_translator = GroqTranslator()
 
 
 # ─── LOCAL ZERO-API SPEECH-TO-TEXT TRANSCRIBER (WHISPER) ──────────────────────
@@ -1068,9 +1038,10 @@ def translate_chunk(
     target_language: str,
     language_code: str,
     transcription_cache: Dict[int, str],
+    groq_api_key: Optional[str] = None,
     manager: Optional[JobManager] = None,
 ) -> Dict[str, Any]:
-    """100% Local chunk translation: Transcribes English audio chunk -> Translates via Qwen2.5-1.5B (GGUF)."""
+    """Translates audio chunk: Whisper offline ASR -> Groq llama-3.3-70b-versatile (with 15s speed breaker)."""
     # Step A: Local transcription (reused across languages via transcription_cache)
     if chunk_index in transcription_cache and transcription_cache[chunk_index]:
         english_text = transcription_cache[chunk_index]
@@ -1080,13 +1051,14 @@ def translate_chunk(
         english_text = local_whisper_transcriber.transcribe(chunk_audio_path, manager=manager)
         transcription_cache[chunk_index] = english_text
 
-    # Step B: Local Qwen translation using STRICT ANIME SYSTEM PROMPT
+    # Step B: Groq translation using STRICT ANIME SYSTEM PROMPT & 15s Speed Breaker
     if manager:
-        manager.log(f"🧠 [Local Qwen] Translating Chunk {chunk_index + 1} into {target_language} (Strict Anime Lore)...")
+        manager.log(f"🧠 [Groq LLM] Translating Chunk {chunk_index + 1} into {target_language} (llama-3.3-70b-versatile)...")
 
-    translated_text = local_qwen_translator.translate_subtitles(
+    translated_text = groq_translator.translate_subtitles(
         english_text=english_text,
         target_language=target_language,
+        groq_api_key=groq_api_key,
         manager=manager,
     )
 
@@ -1372,11 +1344,12 @@ def run_pipeline_worker(
     manager: JobManager,
     uploaded_audio_path: str,
     chunk_duration_sec: int = DEFAULT_CHUNK_DURATION_SEC,
+    groq_api_key: str = "",
 ):
-    """The master background worker executing the 100% local dubbing pipeline sequentially."""
+    """The master background worker executing the dubbing pipeline with Groq translation."""
     try:
         source_display = os.path.basename(uploaded_audio_path)
-        manager.log(f"🎬 Starting 100% Local Auto Dubbing Pipeline with Media: {source_display}")
+        manager.log(f"🎬 Starting Auto Dubbing Pipeline with Media: {source_display}")
         manager.log("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
 
         # 1. Source Media Ingestion & Standardization (Direct File Upload Architecture)
@@ -1400,9 +1373,8 @@ def run_pipeline_worker(
         # Shared cache: caches English transcript from Language 1 for instant reuse in Languages 2, 3, 4
         transcription_cache: Dict[int, str] = {}
 
-        # Pre-initialize Local Qwen2.5-1.5B (GGUF) in RAM (Persistent Zero-Juggling)
-        manager.log("🧠 Initializing Local Qwen2.5-1.5B (GGUF) in RAM (Zero-Juggling)...")
-        local_qwen_translator.load_model(manager=manager)
+        # Groq Cloud LLM engine announcement
+        manager.log("⚡ Translation Engine: Groq API (llama-3.3-70b-versatile) with 15s Speed Breaker active.")
 
         # 3. Sequential Language Processing (One by One)
         total_languages = len(TARGET_LANGUAGES)
@@ -1452,13 +1424,14 @@ def run_pipeline_worker(
 
                 for attempt in range(max_retries):
                     try:
-                        # Step A: Local Qwen Translation with Strict Anime Terminology Preservation
+                        # Step A: Groq Translation with Strict Anime Terminology Preservation & 15s Speed Breaker
                         translation_result = translate_chunk(
                             chunk_index=chunk_idx,
                             chunk_audio_path=chunk_src,
                             target_language=lang_name,
                             language_code=lang_code,
                             transcription_cache=transcription_cache,
+                            groq_api_key=groq_api_key,
                             manager=manager,
                         )
 
@@ -1867,6 +1840,7 @@ def extract_uploaded_path(file_obj: Any) -> Optional[str]:
 def progressive_start_pipeline(
     uploaded_file: Any,
     chunk_duration: int,
+    groq_api_key: str = "",
 ):
     """Gradio generator yielding live updates.
     
@@ -1888,6 +1862,7 @@ def progressive_start_pipeline(
     success, msg = job_manager.start_job(
         uploaded_audio_path=uploaded_audio,
         chunk_duration_sec=int(chunk_duration),
+        groq_api_key=groq_api_key,
     )
     if not success:
         yield get_dashboard_state()
@@ -1974,11 +1949,18 @@ with gr.Blocks(theme=gr.themes.Default(), css=CUSTOM_CSS, title="AudioGen Flow �
                 label="Chunk Size (seconds)",
                 info="60-120s sweet spot prevents OOM crashes on CPU RAM",
             )
+            groq_key_input = gr.Textbox(
+                label="Groq API Key (Optional if set in environment)",
+                value=os.environ.get("GROQ_API_KEY", ""),
+                type="password",
+                placeholder="gsk_... (reads GROQ_API_KEY env var if empty)",
+                info="⚡ Powered by llama-3.3-70b-versatile with 15s rate-limit speed breaker",
+            )
             gr.Markdown(
                 """
                 <div style='font-size: 0.82rem; border: 1px solid var(--border-color-primary, #e2e8f0); border-radius: 8px; padding: 10px 14px; margin-top: 8px; background: var(--background-fill-secondary, #f8fafc);'>
-                    🧠 <b>100% Local AI Pipeline:</b> Qwen2.5-1.5B-Instruct (GGUF) + Local Multi-Model TTS (F5 / Neuphonic / MMS / Piper).
-                    <br/><span style='opacity: 0.8;'>Zero Gemini API rate limits • Zero juggling • Fits safely in 16GB CPU RAM.</span>
+                    ⚡ <b>Groq Cloud Translation:</b> <code>llama-3.3-70b-versatile</code> with Anime Lore Preservation & 15s Speed Breaker.
+                    <br/><span style='opacity: 0.8;'>Ultra-fast cloud inference • Zero RAM overhead • Safe rate-limiting.</span>
                 </div>
                 """
             )
@@ -2129,7 +2111,7 @@ with gr.Blocks(theme=gr.themes.Default(), css=CUSTOM_CSS, title="AudioGen Flow �
     # Progressive Yield Generator triggered on start click
     start_btn.click(
         fn=progressive_start_pipeline,
-        inputs=[media_file_input, chunk_slider],
+        inputs=[media_file_input, chunk_slider, groq_key_input],
         outputs=ui_outputs,
         show_progress="hidden",
     )

@@ -586,6 +586,7 @@ class JobManager:
         uploaded_audio_path: str,
         chunk_duration_sec: int = DEFAULT_CHUNK_DURATION_SEC,
         groq_api_key: str = "",
+        selected_languages: Optional[List[str]] = None,
     ) -> Tuple[bool, str]:
         """Initiates the background dubbing job in a detached daemon thread with Groq translation."""
         with self.lock:
@@ -594,6 +595,11 @@ class JobManager:
 
             if not uploaded_audio_path or not os.path.exists(uploaded_audio_path):
                 err_msg = "Please upload an audio or video file first."
+                self.log(f"❌ {err_msg}", level="ERROR")
+                return False, err_msg
+
+            if selected_languages is not None and len(selected_languages) == 0:
+                err_msg = "Please select at least one language to dub."
                 self.log(f"❌ {err_msg}", level="ERROR")
                 return False, err_msg
 
@@ -611,14 +617,16 @@ class JobManager:
             self.end_time = None
             self.stop_event.clear()
 
+        langs_str = ", ".join(selected_languages) if selected_languages else "All 4 Languages"
         self.log(f"New dubbing job registered (ID: {self.job_id}) for file: {self.source_filename}")
+        self.log(f"🌐 Target Languages: {langs_str}")
         self.log(f"⚡ Translation Engine: Groq API (llama-3.3-70b-versatile) with 15s Speed Breaker")
         self.save_to_disk()
 
         # Start decoupled daemon thread (survives browser disconnects / tab closes)
         self.worker_thread = threading.Thread(
             target=run_pipeline_worker,
-            args=(self, uploaded_audio_path, chunk_duration_sec, groq_api_key),
+            args=(self, uploaded_audio_path, chunk_duration_sec, groq_api_key, selected_languages),
             daemon=True,
             name=f"DubberWorker-{self.job_id}"
         )
@@ -1345,12 +1353,25 @@ def run_pipeline_worker(
     uploaded_audio_path: str,
     chunk_duration_sec: int = DEFAULT_CHUNK_DURATION_SEC,
     groq_api_key: str = "",
+    selected_languages: Optional[List[str]] = None,
 ):
     """The master background worker executing the dubbing pipeline with Groq translation."""
     try:
         source_display = os.path.basename(uploaded_audio_path)
         manager.log(f"🎬 Starting Auto Dubbing Pipeline with Media: {source_display}")
         manager.log("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+
+        # Filter active target languages based on user toggle selection
+        if selected_languages:
+            active_languages = [lang for lang in TARGET_LANGUAGES if lang["name"] in selected_languages]
+        else:
+            active_languages = TARGET_LANGUAGES
+
+        if not active_languages:
+            raise ValueError("No target languages selected for dubbing. Please toggle ON at least one language.")
+
+        total_languages = len(active_languages)
+        manager.log(f"🌐 Active Dubbing Languages ({total_languages}): {', '.join([l['name'] for l in active_languages])}")
 
         # 1. Source Media Ingestion & Standardization (Direct File Upload Architecture)
         source_audio_path, duration_sec = ingest_uploaded_media(
@@ -1377,10 +1398,9 @@ def run_pipeline_worker(
         manager.log("⚡ Translation Engine: Groq API (llama-3.3-70b-versatile) with 15s Speed Breaker active.")
 
         # 3. Sequential Language Processing (One by One)
-        total_languages = len(TARGET_LANGUAGES)
         manager.status = "PROCESSING"
 
-        for lang_idx, lang_info in enumerate(TARGET_LANGUAGES):
+        for lang_idx, lang_info in enumerate(active_languages):
             if manager.stop_event.is_set():
                 raise KeyboardInterrupt("Job was cancelled by user.")
 
@@ -1522,8 +1542,8 @@ def run_pipeline_worker(
         manager.current_language = None
         manager.end_time = time.time()
         elapsed_min = (manager.end_time - manager.start_time) / 60.0
-        manager.message = f"All 4 language dubs successfully generated in {elapsed_min:.1f} minutes!"
-        manager.log(f"🎉 Pipeline finished successfully in {elapsed_min:.1f} minutes.")
+        manager.message = f"Selected {total_languages} language dub(s) successfully generated in {elapsed_min:.1f} minutes!"
+        manager.log(f"🎉 Pipeline finished successfully ({total_languages} language(s) in {elapsed_min:.1f} minutes).")
         manager.save_to_disk()
 
     except KeyboardInterrupt:
@@ -1651,6 +1671,29 @@ CUSTOM_CSS = """
     font-weight: 600;
     padding: 2px 8px;
     border-radius: 6px;
+}
+
+/* Language Toggle Controls */
+.lang-toggle-container {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+    margin: 8px 0 12px 0;
+}
+
+.lang-toggle-box {
+    border: 1px solid var(--border-color-primary, #e2e8f0) !important;
+    border-radius: 8px !important;
+    padding: 6px 12px !important;
+    background: var(--background-fill-secondary, rgba(125, 125, 125, 0.05)) !important;
+    font-weight: 600 !important;
+    font-size: 0.88rem !important;
+    cursor: pointer;
+    transition: all 0.2s ease-in-out;
+}
+
+.lang-toggle-box:hover {
+    border-color: #3b82f6 !important;
 }
 
 /* Action Buttons */
@@ -1841,6 +1884,10 @@ def progressive_start_pipeline(
     uploaded_file: Any,
     chunk_duration: int,
     groq_api_key: str = "",
+    hi_enable: bool = True,
+    es_enable: bool = True,
+    fr_enable: bool = True,
+    pt_enable: bool = True,
 ):
     """Gradio generator yielding live updates.
     
@@ -1849,6 +1896,25 @@ def progressive_start_pipeline(
     immediately yields the updated dashboard with that specific file ready for listening/download,
     while subsequent languages continue processing seamlessly.
     """
+    selected_languages = []
+    if hi_enable:
+        selected_languages.append("Hindi")
+    if es_enable:
+        selected_languages.append("Spanish")
+    if fr_enable:
+        selected_languages.append("French")
+    if pt_enable:
+        selected_languages.append("Portuguese")
+
+    if not selected_languages:
+        yield (
+            "<div style='color: #f87171; background: #2b1216; border: 1px solid #ef4444; border-radius: 8px; padding: 14px 18px; margin: 10px 0;'>"
+            "⚠️ <b>Please select at least one language to dub.</b> Turn ON at least one language toggle button above."
+            "</div>",
+            *get_dashboard_state()[1:]
+        )
+        return
+
     uploaded_audio = extract_uploaded_path(uploaded_file)
     if not uploaded_audio:
         yield (
@@ -1863,6 +1929,7 @@ def progressive_start_pipeline(
         uploaded_audio_path=uploaded_audio,
         chunk_duration_sec=int(chunk_duration),
         groq_api_key=groq_api_key,
+        selected_languages=selected_languages,
     )
     if not success:
         yield get_dashboard_state()
@@ -1964,6 +2031,20 @@ with gr.Blocks(theme=gr.themes.Default(), css=CUSTOM_CSS, title="AudioGen Flow �
                 </div>
                 """
             )
+
+            gr.Markdown(
+                """
+                <div style='margin-top: 14px; margin-bottom: 4px; display: flex; align-items: center; justify-content: space-between;'>
+                    <span style='font-size: 0.92rem; font-weight: 700; color: var(--body-text-color, #f8fafc);'>🌐 Target Languages to Dub (Toggle ON / OFF)</span>
+                    <span style='font-size: 0.76rem; opacity: 0.7;'>Control exactly which languages to dub</span>
+                </div>
+                """
+            )
+            with gr.Row(elem_classes=["lang-toggle-container"]):
+                hi_toggle = gr.Checkbox(label="🇮🇳 Hindi Dub", value=True, elem_classes=["lang-toggle-box"])
+                es_toggle = gr.Checkbox(label="🇪🇸 Spanish Dub", value=True, elem_classes=["lang-toggle-box"])
+                fr_toggle = gr.Checkbox(label="🇫🇷 French Dub", value=True, elem_classes=["lang-toggle-box"])
+                pt_toggle = gr.Checkbox(label="🇧🇷 Portuguese Dub", value=True, elem_classes=["lang-toggle-box"])
 
             # Master Studio Action Buttons
             with gr.Row(elem_classes=["btn-action-row"]):
@@ -2111,7 +2192,15 @@ with gr.Blocks(theme=gr.themes.Default(), css=CUSTOM_CSS, title="AudioGen Flow �
     # Progressive Yield Generator triggered on start click
     start_btn.click(
         fn=progressive_start_pipeline,
-        inputs=[media_file_input, chunk_slider, groq_key_input],
+        inputs=[
+            media_file_input,
+            chunk_slider,
+            groq_key_input,
+            hi_toggle,
+            es_toggle,
+            fr_toggle,
+            pt_toggle,
+        ],
         outputs=ui_outputs,
         show_progress="hidden",
     )

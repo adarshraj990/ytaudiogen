@@ -1873,9 +1873,14 @@ def extract_uploaded_path(file_obj: Any) -> Optional[str]:
         return path if path and os.path.exists(path) else None
     if hasattr(file_obj, "name") and isinstance(file_obj.name, str) and os.path.exists(file_obj.name):
         return file_obj.name
-    if isinstance(file_obj, dict) and "path" in file_obj and os.path.exists(file_obj["path"]):
-        return file_obj["path"]
-    if isinstance(file_obj, list) and len(file_obj) > 0:
+    if hasattr(file_obj, "path") and isinstance(file_obj.path, str) and os.path.exists(file_obj.path):
+        return file_obj.path
+    if isinstance(file_obj, dict):
+        if "path" in file_obj and isinstance(file_obj["path"], str) and os.path.exists(file_obj["path"]):
+            return file_obj["path"]
+        if "name" in file_obj and isinstance(file_obj["name"], str) and os.path.exists(file_obj["name"]):
+            return file_obj["name"]
+    if isinstance(file_obj, (list, tuple)) and len(file_obj) > 0:
         return extract_uploaded_path(file_obj[0])
     return None
 
@@ -1993,7 +1998,8 @@ with gr.Blocks(theme=gr.themes.Default(), css=CUSTOM_CSS, title="AudioGen Flow ‚
             gr.Markdown("### üì• 1. Media Ingestion & Upload")
             media_file_input = gr.File(
                 label="Select or Drag & Drop Long Audio / Video (MP3, MP4, WAV, M4A, MKV up to 500MB+)",
-                file_types=["audio", "video", ".mp3", ".wav", ".m4a", ".aac", ".ogg", ".flac", ".mp4", ".mkv", ".webm", ".avi"],
+                file_types=["audio/*", "video/*", ".mp3", ".wav", ".m4a", ".aac", ".ogg", ".flac", ".mp4", ".mkv", ".webm", ".avi", ".mov"],
+                file_count="single",
                 type="filepath",
                 interactive=True,
                 elem_id="main_media_file_uploader",
@@ -2175,16 +2181,25 @@ with gr.Blocks(theme=gr.themes.Default(), css=CUSTOM_CSS, title="AudioGen Flow ‚
     ]
 
     def on_file_uploaded(file_path):
+        if not file_path:
+            return get_dashboard_state()
         path = extract_uploaded_path(file_path)
         if path and os.path.exists(path):
             size_mb = os.path.getsize(path) / (1024 * 1024)
             name = os.path.basename(path)
-            job_manager.log(f"[File Ingest] üìÅ Media ready for dubbing: {name} ({size_mb:.1f} MB)")
+            job_manager.log(f"[File Ingest] üìÅ Media uploaded successfully: {name} ({size_mb:.1f} MB)")
         return get_dashboard_state()
 
-    media_file_input.change(
+    media_file_input.upload(
         fn=on_file_uploaded,
         inputs=[media_file_input],
+        outputs=ui_outputs,
+        show_progress="hidden",
+    )
+
+    media_file_input.clear(
+        fn=get_dashboard_state,
+        inputs=[],
         outputs=ui_outputs,
         show_progress="hidden",
     )
@@ -2240,4 +2255,6 @@ if __name__ == "__main__":
         server_name="0.0.0.0",
         server_port=7860,
         show_error=True,
+        max_file_size="1000mb",
+        allowed_paths=[WORKSPACE_DIR, OUTPUTS_DIR, "/tmp"],
     )

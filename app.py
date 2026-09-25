@@ -2488,6 +2488,7 @@ with gr.Blocks(theme=gr.themes.Soft(primary_hue="indigo", neutral_hue="slate"), 
                     let activeFileName = "";
                     let activeFileSizeMB = 0;
                     let uploadStartTime = 0;
+                    let uploadTimer = null;
 
                     function getElements() {
                         return {
@@ -2507,6 +2508,7 @@ with gr.Blocks(theme=gr.themes.Soft(primary_hue="indigo", neutral_hue="slate"), 
                         el.card.style.display = "block";
 
                         if (isComplete || percent >= 100) {
+                            if (uploadTimer) { clearInterval(uploadTimer); uploadTimer = null; }
                             el.bar.style.width = "100%";
                             el.bar.style.background = "linear-gradient(90deg, #10b981, #059669)";
                             el.bar.style.boxShadow = "0 0 16px rgba(16, 185, 129, 0.85)";
@@ -2514,111 +2516,180 @@ with gr.Blocks(theme=gr.themes.Soft(primary_hue="indigo", neutral_hue="slate"), 
                             el.badge.style.color = "#10b981";
                             el.badge.style.borderColor = "rgba(16, 185, 129, 0.5)";
                             el.badge.style.background = "rgba(16, 185, 129, 0.15)";
-                            el.title.textContent = activeFileName ? `✅ ${activeFileName} Uploaded (100%)` : "✅ Media Upload Complete (100%)";
-                            el.bytes.textContent = activeFileSizeMB > 0 ? `${activeFileSizeMB.toFixed(1)} MB / ${activeFileSizeMB.toFixed(1)} MB` : "File Ready";
+                            el.title.textContent = activeFileName ? ("✅ " + activeFileName + " (100% Uploaded)") : "✅ Media Upload Complete (100%)";
+                            el.bytes.textContent = activeFileSizeMB > 0 ? (activeFileSizeMB.toFixed(1) + " MB / " + activeFileSizeMB.toFixed(1) + " MB") : "File Verified";
                             el.speed.textContent = "✅ Media verified & ready for dubbing";
                             if (el.spinner) el.spinner.style.display = "none";
                             return;
                         }
 
-                        const pctNum = Math.min(Math.max(parseFloat(percent) || 0, 0), 99.5);
+                        const pctNum = Math.min(Math.max(parseFloat(percent) || 0, 1.0), 99.4);
                         el.bar.style.width = pctNum + "%";
                         el.badge.textContent = Math.round(pctNum) + "%";
-                        el.title.textContent = activeFileName ? `📤 Uploading: ${activeFileName}` : "📤 Uploading Media to Server...";
+                        el.title.textContent = activeFileName ? ("📤 Uploading: " + activeFileName) : "📤 Uploading Media to Server...";
                         if (el.spinner) el.spinner.style.display = "inline-block";
 
                         if (loadedMB && totalMB) {
-                            el.bytes.textContent = `${loadedMB} MB / ${totalMB} MB`;
+                            el.bytes.textContent = loadedMB + " MB / " + totalMB + " MB";
                             const elapsedSec = (Date.now() - uploadStartTime) / 1000;
-                            if (elapsedSec > 0.5) {
+                            if (elapsedSec > 0.4) {
                                 const speed = (parseFloat(loadedMB) / elapsedSec).toFixed(1);
-                                el.speed.textContent = `⚡ Speed: ~${speed} MB/s (Streaming to disk)`;
+                                el.speed.textContent = "⚡ Speed: ~" + speed + " MB/s (Streaming to disk)";
                             }
                         } else if (activeFileSizeMB > 0) {
                             const estLoaded = ((pctNum / 100) * activeFileSizeMB).toFixed(1);
-                            el.bytes.textContent = `${estLoaded} MB / ${activeFileSizeMB.toFixed(1)} MB`;
+                            el.bytes.textContent = estLoaded + " MB / " + activeFileSizeMB.toFixed(1) + " MB";
                         }
                     }
 
-                    // Hook XMLHttpRequest to track upload percentage
-                    if (!window.__xhrUploadHooked) {
-                        window.__xhrUploadHooked = true;
-                        const origOpen = XMLHttpRequest.prototype.open;
-                        const origSend = XMLHttpRequest.prototype.send;
+                    // 1. Hook window.fetch (Gradio 4 uses fetch for /upload)
+                    if (!window.__fetchUploadHooked) {
+                        window.__fetchUploadHooked = true;
+                        const origFetch = window.fetch;
+                        window.fetch = function(input, init) {
+                            const url = (typeof input === "string") ? input : (input && input.url ? input.url : "");
+                            const isUpload = url && (url.includes("/upload") || url.includes("upload") || url.includes("gradio_api/upload")) && init && (init.method === "POST" || !init.method);
 
-                        XMLHttpRequest.prototype.open = function(method, url) {
-                            this._reqUrl = url ? url.toString() : "";
-                            return origOpen.apply(this, arguments);
-                        };
+                            if (isUpload && init.body && (init.body instanceof FormData)) {
+                                return new Promise(function(resolve, reject) {
+                                    try {
+                                        for (let pair of init.body.entries()) {
+                                            if (pair[1] && (pair[1] instanceof File || (pair[1].name && pair[1].size))) {
+                                                activeFileName = pair[1].name;
+                                                activeFileSizeMB = pair[1].size / (1024 * 1024);
+                                                break;
+                                            }
+                                        }
+                                    } catch(err) {}
 
-                        XMLHttpRequest.prototype.send = function(body) {
-                            const url = this._reqUrl || "";
-                            const isUpload = url.includes("upload") || url.includes("gradio_api");
+                                    uploadStartTime = Date.now();
+                                    updateProgress(2, "0.1", activeFileSizeMB ? activeFileSizeMB.toFixed(1) : "...", false);
 
-                            if (isUpload && this.upload) {
-                                uploadStartTime = Date.now();
-                                this.upload.addEventListener("progress", function(e) {
-                                    if (e.lengthComputable && e.total > 0) {
-                                        const pct = ((e.loaded / e.total) * 100).toFixed(1);
-                                        const loadedMB = (e.loaded / (1024 * 1024)).toFixed(1);
-                                        const totalMB = (e.total / (1024 * 1024)).toFixed(1);
-                                        if (!activeFileSizeMB) activeFileSizeMB = parseFloat(totalMB);
-                                        updateProgress(pct, loadedMB, totalMB, false);
+                                    const xhr = new XMLHttpRequest();
+                                    xhr.open("POST", url);
+
+                                    if (init.headers) {
+                                        try {
+                                            if (init.headers instanceof Headers) {
+                                                init.headers.forEach(function(val, key) {
+                                                    if (key.toLowerCase() !== "content-type") xhr.setRequestHeader(key, val);
+                                                });
+                                            } else if (typeof init.headers === "object") {
+                                                for (let k in init.headers) {
+                                                    if (k.toLowerCase() !== "content-type") xhr.setRequestHeader(k, init.headers[k]);
+                                                }
+                                            }
+                                        } catch(e) {}
                                     }
-                                });
 
-                                this.upload.addEventListener("load", function() {
-                                    updateProgress(100, null, null, true);
+                                    if (xhr.upload) {
+                                        xhr.upload.addEventListener("progress", function(e) {
+                                            if (e.lengthComputable && e.total > 0) {
+                                                const pct = ((e.loaded / e.total) * 100).toFixed(1);
+                                                const loadedMB = (e.loaded / (1024 * 1024)).toFixed(1);
+                                                const totalMB = (e.total / (1024 * 1024)).toFixed(1);
+                                                if (!activeFileSizeMB) activeFileSizeMB = parseFloat(totalMB);
+                                                updateProgress(pct, loadedMB, totalMB, false);
+                                            }
+                                        });
+
+                                        xhr.upload.addEventListener("load", function() {
+                                            updateProgress(100, null, null, true);
+                                        });
+                                    }
+
+                                    xhr.onload = function() {
+                                        const responseHeaders = new Headers();
+                                        const raw = xhr.getAllResponseHeaders();
+                                        if (raw) {
+                                            raw.trim().split(/[\r\n]+/).forEach(function(line) {
+                                                const parts = line.split(": ");
+                                                const key = parts.shift();
+                                                const val = parts.join(": ");
+                                                if (key) responseHeaders.set(key, val);
+                                            });
+                                        }
+                                        const resp = new Response(xhr.responseText, {
+                                            status: xhr.status,
+                                            statusText: xhr.statusText,
+                                            headers: responseHeaders
+                                        });
+                                        updateProgress(100, null, null, true);
+                                        resolve(resp);
+                                    };
+
+                                    xhr.onerror = function() {
+                                        origFetch(input, init).then(resolve).catch(reject);
+                                    };
+
+                                    xhr.send(init.body);
                                 });
                             }
-                            return origSend.apply(this, arguments);
+
+                            return origFetch.apply(this, arguments);
                         };
                     }
 
-                    // Hook native input file picker
-                    function attachFileInputWatcher() {
+                    // 2. Global Document Event Listener for file inputs
+                    document.addEventListener("change", function(e) {
+                        if (e.target && e.target.type === "file" && e.target.files && e.target.files[0]) {
+                            const f = e.target.files[0];
+                            activeFileName = f.name;
+                            activeFileSizeMB = f.size / (1024 * 1024);
+                            uploadStartTime = Date.now();
+                            updateProgress(3, "0.1", activeFileSizeMB.toFixed(1), false);
+                        }
+                    }, true);
+
+                    // 3. Global Drag and Drop Listener
+                    document.addEventListener("drop", function(e) {
+                        if (e.dataTransfer && e.dataTransfer.files && e.dataTransfer.files[0]) {
+                            const f = e.dataTransfer.files[0];
+                            activeFileName = f.name;
+                            activeFileSizeMB = f.size / (1024 * 1024);
+                            uploadStartTime = Date.now();
+                            updateProgress(3, "0.1", activeFileSizeMB.toFixed(1), false);
+                        }
+                    }, true);
+
+                    // 4. MutationObserver for Gradio's Svelte Upload State
+                    const observer = new MutationObserver(function() {
                         const uploader = document.getElementById("main_media_file_uploader");
                         if (!uploader) return;
-                        const input = uploader.querySelector("input[type='file']");
-                        if (input && !input.__uploadListenerAttached) {
-                            input.__uploadListenerAttached = true;
-                            input.addEventListener("change", function(e) {
-                                if (e.target.files && e.target.files[0]) {
-                                    const f = e.target.files[0];
-                                    activeFileName = f.name;
-                                    activeFileSizeMB = f.size / (1024 * 1024);
-                                    uploadStartTime = Date.now();
-                                    updateProgress(1, "0.1", activeFileSizeMB.toFixed(1), false);
+
+                        const text = uploader.innerText || "";
+                        const isUploading = text.includes("Uploading") || !!uploader.querySelector(".uploading, .progress, progress");
+                        const isDone = text.includes("Clear") || !!uploader.querySelector("button[aria-label='Clear'], .file-preview, .download");
+
+                        if (isUploading) {
+                            const el = getElements();
+                            if (el.card && el.card.style.display === "none") {
+                                const lines = text.split("\n");
+                                for (let l of lines) {
+                                    if (l.includes(".mp3") || l.includes(".mp4") || l.includes(".wav") || l.includes(".mkv") || l.includes(".m4a")) {
+                                        activeFileName = l.trim();
+                                        break;
+                                    }
                                 }
-                            });
-                        }
-                    }
+                                uploadStartTime = Date.now();
+                                updateProgress(5, null, null, false);
 
-                    // Observer loop for Gradio upload progress CSS variables and DOM events
-                    setInterval(function() {
-                        attachFileInputWatcher();
-
-                        const progressWidth = document.documentElement.style.getPropertyValue("--upload-progress-width");
-                        if (progressWidth && progressWidth.endsWith("%")) {
-                            const pct = parseFloat(progressWidth);
-                            if (!isNaN(pct) && pct > 0) {
-                                updateProgress(pct, null, null, pct >= 100);
-                            }
-                        }
-
-                        const uploader = document.getElementById("main_media_file_uploader");
-                        if (uploader) {
-                            const hasFileUploaded = uploader.querySelector(".file-preview, .download, button[aria-label='Clear']");
-                            if (hasFileUploaded) {
-                                const el = getElements();
-                                if (el.card && el.card.style.display !== "none" && el.badge.textContent !== "100%") {
-                                    updateProgress(100, null, null, true);
+                                if (!uploadTimer) {
+                                    let cur = 5;
+                                    uploadTimer = setInterval(function() {
+                                        cur += (95 - cur) * 0.08;
+                                        updateProgress(cur, null, null, false);
+                                    }, 400);
                                 }
                             }
                         }
-                    }, 400);
 
-                    document.addEventListener("DOMContentLoaded", attachFileInputWatcher);
+                        if (isDone) {
+                            updateProgress(100, null, null, true);
+                        }
+                    });
+
+                    observer.observe(document.body, { childList: true, subtree: true, characterData: true });
                 })();
                 </script>
                 """

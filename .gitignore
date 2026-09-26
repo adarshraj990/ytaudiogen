@@ -10,3 +10,5 @@ episodes_output/
 storage/
 output/
 model_cache/
+core_1_ours.wav
+*.wav

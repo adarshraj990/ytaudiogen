@@ -1,20 +1,20 @@
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 #  REQUIREMENTS — Hugging Face Gradio SDK
-#  Fast Direct Media Dubber (English to Hindi, Spanish, French, Portuguese)
+#  SRT-Driven Offline Audio Dubber (F5-TTS & Precise FFmpeg Timeline Sync)
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-# Groq High-Speed Cloud LLM Engine
-groq>=0.9.0
+# F5-TTS Zero-Shot Voice Generation
+f5-tts
 
-# Lazy-Loaded TTS Engines & Transformers (Capped <4.45.0 to avoid pip backtracking with huggingface_hub<1.0.0)
+# Core Audio & Deep Learning Engines
 transformers>=4.40.0,<4.45.0
 torch
 torchaudio
 safetensors
-piper-tts
 soundfile>=0.12.1
 pydub>=0.25.1
 onnxruntime>=1.20.1
+piper-tts
 numpy
 
 # Hugging Face Hub (<1.0.0 required for Gradio 4.44.1 HfFolder compatibility)

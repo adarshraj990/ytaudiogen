@@ -863,7 +863,7 @@ def clean_translated_output(raw: str) -> str:
 
 
 class GroqTranslator:
-    """Translation engine using Groq API (llama-3.3-70b-versatile) with fail-safe retry logic."""
+    """Translation engine using Groq API (llama-3.3-70b-versatile) with zero artificial delay and smart retry."""
     def __init__(self):
         self.default_model = "llama-3.3-70b-versatile"
         self.max_retries = 3
@@ -877,11 +877,11 @@ class GroqTranslator:
     ) -> str:
         """Translates English dialogue into target_language using Groq llama-3.3-70b-versatile.
         
-        SMART RETRY & FAIL-SAFE LOGIC (CHAPTER FOUR):
+        SMART RETRY & ZERO ARTIFICIAL DELAY ARCHITECTURE (CHAPTER FOUR):
         1. Groq API & Anime Prompt: llama-3.3-70b-versatile with exact anime lore system prompt.
-        2. 15-Second Delay: Mandatory time.sleep(15) at the end of every successful chunk translation cycle.
-        3. Smart Retry Fallback: On API error (429 Rate Limit, timeout, etc.), logs warning
-           'API Error caught. Waiting 30s to retry...', executes time.sleep(30), and retries up to 3 times.
+        2. Zero Artificial Delay: No time.sleep() on successful calls. TTS processing time serves as natural buffer.
+        3. Smart Retry Fallback: On 429 Rate Limit / API error, logs 'Rate Limit hit. Waiting 15s to retry...',
+           sleeps 15s, and retries up to 3 times per chunk. If all 3 fail, safely moves on without breaking main loop.
         """
         if not english_text or len(english_text.strip()) < 2:
             return ""
@@ -972,13 +972,8 @@ class GroqTranslator:
 
                 if translated_text and len(translated_text.strip()) >= 3:
                     if manager:
-                        manager.log(f"✅ [Groq API] Translation received successfully ({len(translated_text.split())} words).")
-                    
-                    # ─── REQUIREMENT 2: THE 15-SECOND DELAY ───────────────────
-                    # Add a mandatory time.sleep(15) at the end of every successful chunk translation cycle
-                    if manager:
-                        manager.log("⏱️ [Speed Breaker] Translation successful. Mandatory 15s speed breaker delay...")
-                    time.sleep(15)
+                        manager.log(f"✅ [Groq API] Translation received successfully ({len(translated_text.split())} words). Maximum speed active.")
+                    # ZERO ARTIFICIAL DELAY: No sleep on successful API call. Proceed immediately.
                     return translated_text
                 else:
                     raise ValueError("Groq returned empty or invalid translation response.")
@@ -986,24 +981,24 @@ class GroqTranslator:
             except Exception as e:
                 last_error = e
                 err_msg = str(e)
-                # ─── REQUIREMENT 3: SMART RETRY FALLBACK (CRITICAL FAIL-SAFE) ───
-                log_msg = f"⚠️ [Groq API] API Error caught. Waiting 30s to retry... (Attempt {attempt}/{self.max_retries}, Error: {err_msg})"
+                # ─── REQUIREMENT 3: SMART RETRY FALLBACK (ONLY ON ERROR) ───
+                log_msg = f"⚠️ [Groq API] Rate Limit hit. Waiting 15s to retry... (Attempt {attempt}/{self.max_retries}, Error: {err_msg})"
                 if manager:
                     manager.log(log_msg, level="WARNING")
                 else:
                     logger.warning(log_msg)
 
                 if attempt < self.max_retries:
-                    # Wait 30s before retrying the exact same chunk
-                    for _ in range(30):
+                    # Wait 15s before retrying the exact same chunk
+                    for _ in range(15):
                         if manager and manager.stop_event.is_set():
                             raise KeyboardInterrupt("Job was cancelled by user.")
                         time.sleep(1)
                 else:
                     if manager:
                         manager.log(
-                            f"⚠️ [Groq API] All {self.max_retries} attempts failed ({last_error}). "
-                            f"Using canonical anime lore fallback to preserve pipeline continuity.",
+                            f"⚠️ [Groq API] All {self.max_retries} attempts failed for this chunk ({last_error}). "
+                            f"Safely using canonical anime lore fallback and moving to next chunk without breaking main loop.",
                             level="WARNING"
                         )
 
@@ -1534,9 +1529,6 @@ def run_pipeline_worker(
                 if chunk_idx % 5 == 0:
                     gc.collect()
 
-                # Step C: Micro pause between chunks to yield CPU cycles
-                time.sleep(0.5)
-
             # Step D: Sequential Audio Stitching using Zero-RAM FFmpeg Demuxer
             manager.message = f"Stitching master track for {lang_name} using Zero-RAM FFmpeg..."
             master_mp3 = stitch_chunks_ffmpeg(dubbed_chunk_paths, final_lang_output, manager)
@@ -2060,13 +2052,13 @@ with gr.Blocks(theme=gr.themes.Default(), css=CUSTOM_CSS, title="AudioGen Flow �
                 value=os.environ.get("GROQ_API_KEY", ""),
                 type="password",
                 placeholder="gsk_... (reads GROQ_API_KEY env var if empty)",
-                info="⚡ Powered by llama-3.3-70b-versatile with 15s rate-limit speed breaker",
+                info="⚡ Powered by llama-3.3-70b-versatile with zero artificial delay & 15s smart retry fail-safe",
             )
             gr.Markdown(
                 """
                 <div style='font-size: 0.82rem; border: 1px solid var(--border-color-primary, #e2e8f0); border-radius: 8px; padding: 10px 14px; margin-top: 8px; background: var(--background-fill-secondary, #f8fafc);'>
-                    ⚡ <b>Groq Cloud Translation:</b> <code>llama-3.3-70b-versatile</code> with Anime Lore Preservation & 15s Speed Breaker.
-                    <br/><span style='opacity: 0.8;'>Ultra-fast cloud inference • Zero RAM overhead • Safe rate-limiting.</span>
+                    ⚡ <b>Groq Cloud Translation:</b> <code>llama-3.3-70b-versatile</code> with Anime Lore Preservation & Zero Artificial Delay.
+                    <br/><span style='opacity: 0.8;'>Maximum dubbing speed • Natural TTS pacing buffer • Smart 15s retry fail-safe on 429 limits.</span>
                 </div>
                 """
             )

@@ -328,6 +328,53 @@ indic_f5_generator = IndicF5Generator(
 )
 
 
+# ─── TIME & DURATION CONVERSION UTILITIES ──────────────────────────────────
+def parse_duration_to_seconds(dur_input: Any) -> float:
+    """Parses duration from HH:MM:SS, MM:SS, seconds string, or numeric input into seconds."""
+    if dur_input is None:
+        return 120.0
+    if isinstance(dur_input, (int, float)):
+        return max(1.0, float(dur_input))
+
+    s = str(dur_input).strip()
+    if not s:
+        return 120.0
+
+    # Format: HH:MM:SS or MM:SS
+    if ":" in s:
+        parts = s.split(":")
+        try:
+            if len(parts) == 3:
+                h = float(parts[0])
+                m = float(parts[1])
+                sec = float(parts[2])
+                return max(1.0, h * 3600.0 + m * 60.0 + sec)
+            elif len(parts) == 2:
+                m = float(parts[0])
+                sec = float(parts[1])
+                return max(1.0, m * 60.0 + sec)
+        except Exception:
+            pass
+
+    # Format: Pure integer or float string
+    try:
+        val = float(s)
+        return max(1.0, val)
+    except Exception:
+        pass
+
+    return 120.0
+
+
+def format_seconds_to_hms(seconds: float) -> str:
+    """Converts seconds into formatted HH:MM:SS string."""
+    total_sec = int(round(max(0.0, float(seconds))))
+    h = total_sec // 3600
+    m = (total_sec % 3600) // 60
+    s = total_sec % 60
+    return f"{h:02d}:{m:02d}:{s:02d}"
+
+
 # ─── REQUIREMENT 3: FFMPEG SILENT CANVAS AUDIO SYNCING ───────────────────────
 def build_silent_canvas_dubbed_audio(
     total_duration_sec: float,
@@ -340,9 +387,10 @@ def build_silent_canvas_dubbed_audio(
     """
     total_duration_sec = max(1.0, float(total_duration_sec))
     total_duration_ms = int(total_duration_sec * 1000)
+    hms_str = format_seconds_to_hms(total_duration_sec)
 
     if manager:
-        manager.log(f"🔇 [Silent Canvas] Generating {total_duration_sec:.1f}s silent canvas base via FFmpeg anullsrc...")
+        manager.log(f"🔇 [Silent Canvas] Generating {hms_str} ({total_duration_sec:.1f}s) silent canvas base via FFmpeg anullsrc...")
 
     os.makedirs(WORKSPACE_DIR, exist_ok=True)
     os.makedirs(os.path.dirname(os.path.abspath(final_output_path)), exist_ok=True)
@@ -420,7 +468,7 @@ def build_silent_canvas_dubbed_audio(
 
     if manager:
         final_size_kb = os.path.getsize(final_output_path) // 1024
-        manager.log(f"✅ [Audio Sync] Master dubbed audio finalized: {os.path.basename(final_output_path)} ({final_size_kb} KB, {total_duration_sec:.1f}s)")
+        manager.log(f"✅ [Audio Sync] Master dubbed audio finalized: {os.path.basename(final_output_path)} ({final_size_kb} KB, {hms_str})")
 
     # Cleanup temporary silent track
     if os.path.exists(silent_base_path):
@@ -497,8 +545,9 @@ class JobManager:
             self.end_time = None
             self.stop_event.clear()
 
+        hms_str = format_seconds_to_hms(total_duration)
         self.log(f"New Indic-F5 dubbing job registered (ID: {self.job_id})")
-        self.log(f"⏱️ Total Duration: {total_duration:.1f}s | 📝 Subtitles: {os.path.basename(srt_file_path)}")
+        self.log(f"⏱️ Total Duration: {hms_str} ({total_duration:.1f}s) | 📝 Subtitles: {os.path.basename(srt_file_path)}")
         self.save_to_disk()
 
         self.worker_thread = threading.Thread(
@@ -573,8 +622,9 @@ def run_indic_dubbing_worker(
 ):
     """Executes the Indic-F5 (0.3B) SRT-driven dubbing pipeline onto silent canvas."""
     try:
+        hms_str = format_seconds_to_hms(total_duration)
         manager.log("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
-        manager.log(f"🚀 Starting Indic-F5 (0.3B) Audio Dubbing Pipeline ({total_duration:.1f}s)")
+        manager.log(f"🚀 Starting Indic-F5 (0.3B) Audio Dubbing Pipeline ({hms_str})")
         manager.log("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
 
         # 1. Parse SRT Subtitle File
@@ -833,17 +883,11 @@ def get_dashboard_state() -> Tuple[str, float, str, Optional[str], Any, Any]:
     )
 
 
-# ─── REQUIREMENT 2: UI MODIFICATION (MANUAL DURATION) ────────────────────────
+# ─── REQUIREMENT 2: UI MODIFICATION (MANUAL DURATION IN HH:MM:SS) ─────────────
 def start_pipeline_handler(total_duration: Any, srt_file: Any):
-    """Initiates dubbing job with manual duration and yields live status updates."""
+    """Initiates dubbing job with manual duration (HH:MM:SS) and yields live status updates."""
     srt_path = extract_uploaded_path(srt_file)
-
-    try:
-        duration_val = float(total_duration)
-        if duration_val <= 0:
-            duration_val = 120.0
-    except Exception:
-        duration_val = 120.0
+    duration_val = parse_duration_to_seconds(total_duration)
 
     if not srt_path:
         yield (
@@ -907,18 +951,18 @@ with gr.Blocks(theme=gr.themes.Default(), css=CUSTOM_CSS, title="Indic-F5 Audio 
     # 2. Main Workstation: Exactly TWO Inputs (Manual Duration & SRT File)
     with gr.Row():
         with gr.Column(scale=5, elem_classes=["studio-panel"]):
-            gr.Markdown("### ⏱️ 1. Total Video Duration")
-            total_duration_input = gr.Number(
-                label="Total Video Duration (in seconds)",
-                value=120,
-                minimum=1,
-                step=1,
+            gr.Markdown("### ⏱️ 1. Total Video Duration (HH:MM:SS)")
+            total_duration_input = gr.Textbox(
+                label="Total Video Duration (Hours:Min:Sec)",
+                value="00:02:00",
+                placeholder="HH:MM:SS (e.g. 01:30:00 or 00:02:00)",
                 interactive=True,
             )
             gr.Markdown(
                 """
                 <div style='font-size: 0.82rem; opacity: 0.75; margin-top: 4px;'>
-                    🔇 <b>Silent Canvas Base:</b> FFmpeg generates an exact silent track (<code>anullsrc</code>) of this length, and overlays all dubbed sentence chunks at their exact SRT start_time.
+                    🔇 <b>Format:</b> <code>HH:MM:SS</code> (Hours:Minutes:Seconds, e.g., <code>01:30:00</code> for 1 hr 30 min, <code>00:02:00</code> for 2 min).
+                    FFmpeg generates an exact silent track (<code>anullsrc</code>) matching this duration.
                 </div>
                 """
             )

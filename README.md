@@ -10,32 +10,26 @@ app_file: app.py
 pinned: false
 ---
 
-# 🎙️ AudioGen Flow Studio — Pure SRT-Driven Local Audio Dubber
+# 🎙️ AudioGen Flow Studio — Indic-F5 (0.3B) SRT-Driven Audio Dubber
 
-A high-efficiency, offline, sentence-level audio dubbing studio engineered to run smoothly on local environments and Hugging Face Spaces (CPU Tier).
+A high-efficiency, offline, sentence-level audio dubbing studio powered by the **Indic-F5 (0.3B parameters)** Hindi-English code-switched model and FFmpeg silent canvas alignment.
 
 ## 🚀 Architecture Highlights
 
-1. **Two Simple Inputs**:
-   - **Original Audio File** (`.wav` or `.mp3` extracted from video)
-   - **Translated Subtitle File** (`.srt`)
-   - **Output**: Pristine sample-synchronized mixed master `.wav`.
+1. **Streamlined UI Inputs**:
+   - **Total Video Duration**: Exact duration (in seconds, numeric input with default 120s).
+   - **Translated Subtitle File**: Standard subtitle file (`.srt`).
+   - **Output**: Master dubbed audio file (`.wav`) matching the exact video timeline.
 
-2. **Zero Overhead**:
-   - Zero Whisper ASR logic/dependencies.
-   - Zero LLM / Groq / Gemini API calls or arbitrary chunking.
-   - 100% offline, sentence-level dubbing driven strictly by SRT timestamps.
-
-3. **Core SRT Parsing Engine**:
-   - Extracts millisecond-accurate `start_time`, `end_time`, and clean dialogue text.
-   - Robust fail-safe automatically filters out empty or whitespace-only subtitle blocks.
-
-4. **Sentence-Level F5-TTS Generation**:
-   - Hardcoded reference audio: `core_1_ours.wav` (default female voice).
+2. **Indic-F5 (0.3B) Code-Switched Engine**:
+   - Model: [`Tharshan/indicf5_hindi-english_code_switch`](https://huggingface.co/Tharshan/indicf5_hindi-english_code_switch) (0.3B parameters).
+   - Specialized for Hindi-English code-switched (Hinglish) dialogue with natural Indian voice prosody.
+   - Hardcoded reference voice: `core_1_ours.wav`.
    - Strict 0 KB crash check with automated single-retry before skipping any problematic block.
 
-5. **Precise FFmpeg Audio Syncing & Mixing**:
-   - Overlays each generated sentence audio clip at its exact SRT `start_time` offset.
-   - Automated audio mixing: Lowers original audio track volume to **10%** (preserving background music & sound effects) and sets F5-TTS dubbed dialogue to **100%**.
+3. **FFmpeg Silent Canvas Alignment**:
+   - Generates a completely silent base canvas audio of exact `total_duration` seconds via `anullsrc`.
+   - Overlays each generated Indic-F5 sentence chunk at its exact SRT `start_time` offset.
+   - Trims and pads timeline boundaries to guarantee an exact match with the target video duration.
    - Exports the combined master timeline as a single pristine `.wav` file.
 

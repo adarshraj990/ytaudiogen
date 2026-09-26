@@ -1,26 +1,26 @@
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 #  REQUIREMENTS — Hugging Face Gradio SDK
-#  SRT-Driven Offline Audio Dubber (F5-TTS & Precise FFmpeg Timeline Sync)
+#  Indic-F5 (0.3B) SRT-Driven Audio Dubber (Tharshan/indicf5_hindi-english_code_switch)
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-# F5-TTS Zero-Shot Voice Generation
-f5-tts
-
-# Core Audio & Deep Learning Engines
-transformers>=4.40.0,<4.45.0
-torch
-torchaudio
-safetensors
+# Indic-F5 (0.3B) Dependencies
+torch>=2.2
+torchaudio>=2.2
+torchdiffeq>=0.2
+x-transformers>=1.30
+vocos>=0.1
+librosa>=0.10
 soundfile>=0.12.1
+safetensors>=0.4
+
+# Core Transformers & Hugging Face Hub (pinned <4.45.0 for Gradio 4.44.1 compatibility)
+transformers>=4.40.0,<4.45.0
+huggingface_hub>=0.23.0,<1.0.0
+starlette<1.0.0
+pydantic<2.11.0
+
+# Audio Processing & Utilities
 pydub>=0.25.1
-onnxruntime>=1.20.1
 piper-tts
 numpy
-
-# Hugging Face Hub (<1.0.0 required for Gradio 4.44.1 HfFolder compatibility)
-huggingface_hub>=0.23.0,<1.0.0
-# Starlette (<1.0.0 required for Gradio 4.44.1 TemplateResponse compatibility)
-starlette<1.0.0
-# Pydantic (<2.11.0 required for Gradio 4.44.1 JSON schema parser compatibility)
-pydantic<2.11.0
 requests

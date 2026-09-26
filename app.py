@@ -1074,9 +1074,11 @@ with gr.Blocks(theme=gr.themes.Default(), css=CUSTOM_CSS, title="Indic-F5 Audio 
 if __name__ == "__main__":
     ensure_reference_audio()
     demo.queue(max_size=10).launch(
+        share=True,
         server_name="0.0.0.0",
         server_port=7860,
         show_error=True,
         max_file_size="1000mb",
         allowed_paths=[WORKSPACE_DIR, OUTPUTS_DIR, "/tmp"],
     )
+

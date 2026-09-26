@@ -863,9 +863,10 @@ def clean_translated_output(raw: str) -> str:
 
 
 class GroqTranslator:
-    """Translation engine using Groq API (llama-3.3-70b-versatile) with strict 15s speed breaker."""
+    """Translation engine using Groq API (llama-3.3-70b-versatile) with fail-safe retry logic."""
     def __init__(self):
         self.default_model = "llama-3.3-70b-versatile"
+        self.max_retries = 3
 
     def translate_subtitles(
         self,
@@ -876,9 +877,11 @@ class GroqTranslator:
     ) -> str:
         """Translates English dialogue into target_language using Groq llama-3.3-70b-versatile.
         
-        CRITICAL REQUIREMENT:
-        Enforces time.sleep(15) immediately after every single Groq API translation request
-        to prevent 429 Rate Limit errors.
+        SMART RETRY & FAIL-SAFE LOGIC (CHAPTER FOUR):
+        1. Groq API & Anime Prompt: llama-3.3-70b-versatile with exact anime lore system prompt.
+        2. 15-Second Delay: Mandatory time.sleep(15) at the end of every successful chunk translation cycle.
+        3. Smart Retry Fallback: On API error (429 Rate Limit, timeout, etc.), logs warning
+           'API Error caught. Waiting 30s to retry...', executes time.sleep(30), and retries up to 3 times.
         """
         if not english_text or len(english_text.strip()) < 2:
             return ""
@@ -910,69 +913,99 @@ class GroqTranslator:
             "max_tokens": 512,
         }
 
-        translated_text = ""
-        try:
-            if manager:
-                manager.log(f"⚡ [Groq API] Requesting translation ({self.default_model}) for {target_language}...")
+        last_error = None
+        for attempt in range(1, self.max_retries + 1):
+            if manager and manager.stop_event.is_set():
+                raise KeyboardInterrupt("Job was cancelled by user.")
 
-            # 1. Try official groq SDK if installed
-            if HAS_GROQ:
-                try:
-                    client = Groq(api_key=api_key)
-                    completion = client.chat.completions.create(
-                        model=self.default_model,
-                        messages=[
-                            {"role": "system", "content": STRICT_ANIME_SYSTEM_PROMPT},
-                            {"role": "user", "content": f"Target Language: {target_language}\n\nEnglish Subtitles:\n{english_text.strip()}"},
-                        ],
-                        temperature=0.3,
-                        max_tokens=512,
+            try:
+                if manager:
+                    manager.log(f"⚡ [Groq API] Translating to {target_language} (Attempt {attempt}/{self.max_retries}, Model: {self.default_model})...")
+
+                translated_text = ""
+
+                # Step 1: Try official Groq Python SDK if installed
+                if HAS_GROQ:
+                    try:
+                        client = Groq(api_key=api_key, timeout=25.0)
+                        completion = client.chat.completions.create(
+                            model=self.default_model,
+                            messages=[
+                                {"role": "system", "content": STRICT_ANIME_SYSTEM_PROMPT},
+                                {"role": "user", "content": f"Target Language: {target_language}\n\nEnglish Subtitles:\n{english_text.strip()}"},
+                            ],
+                            temperature=0.3,
+                            max_tokens=512,
+                        )
+                        raw_out = completion.choices[0].message.content or ""
+                        translated_text = clean_translated_output(raw_out)
+                    except Exception as sdk_err:
+                        err_str = str(sdk_err)
+                        if "429" in err_str or "rate_limit" in err_str.lower() or "too many requests" in err_str.lower():
+                            raise sdk_err
+                        if manager:
+                            manager.log(f"⚠️ [Groq SDK] SDK notice ({sdk_err}), trying direct HTTP REST fallback...", level="WARNING")
+
+                # Step 2: Direct HTTP REST fallback via urllib (zero external dependency)
+                if not translated_text:
+                    req = urllib.request.Request(
+                        "https://api.groq.com/openai/v1/chat/completions",
+                        data=json.dumps(payload).encode("utf-8"),
+                        headers=headers,
+                        method="POST",
                     )
-                    raw_out = completion.choices[0].message.content or ""
-                    translated_text = clean_translated_output(raw_out)
-                except Exception as sdk_err:
+                    ctx = ssl.create_default_context()
+                    try:
+                        with urllib.request.urlopen(req, timeout=30, context=ctx) as resp:
+                            resp_data = json.loads(resp.read().decode("utf-8"))
+                    except urllib.error.HTTPError as http_err:
+                        raise http_err
+                    except Exception:
+                        ctx_unverified = ssl._create_unverified_context()
+                        with urllib.request.urlopen(req, timeout=30, context=ctx_unverified) as resp:
+                            resp_data = json.loads(resp.read().decode("utf-8"))
+
+                    choices = resp_data.get("choices", [])
+                    if choices:
+                        raw_out = choices[0].get("message", {}).get("content", "").strip()
+                        translated_text = clean_translated_output(raw_out)
+
+                if translated_text and len(translated_text.strip()) >= 3:
                     if manager:
-                        manager.log(f"⚠️ [Groq SDK] SDK notice ({sdk_err}), trying direct HTTP REST...", level="WARNING")
+                        manager.log(f"✅ [Groq API] Translation received successfully ({len(translated_text.split())} words).")
+                    
+                    # ─── REQUIREMENT 2: THE 15-SECOND DELAY ───────────────────
+                    # Add a mandatory time.sleep(15) at the end of every successful chunk translation cycle
+                    if manager:
+                        manager.log("⏱️ [Speed Breaker] Translation successful. Mandatory 15s speed breaker delay...")
+                    time.sleep(15)
+                    return translated_text
+                else:
+                    raise ValueError("Groq returned empty or invalid translation response.")
 
-            # 2. Direct HTTP REST fallback via urllib (zero external dependency)
-            if not translated_text:
-                req = urllib.request.Request(
-                    "https://api.groq.com/openai/v1/chat/completions",
-                    data=json.dumps(payload).encode("utf-8"),
-                    headers=headers,
-                    method="POST",
-                )
-                ctx = ssl.create_default_context()
-                try:
-                    with urllib.request.urlopen(req, timeout=30, context=ctx) as resp:
-                        resp_data = json.loads(resp.read().decode("utf-8"))
-                except Exception:
-                    ctx_unverified = ssl._create_unverified_context()
-                    with urllib.request.urlopen(req, timeout=30, context=ctx_unverified) as resp:
-                        resp_data = json.loads(resp.read().decode("utf-8"))
+            except Exception as e:
+                last_error = e
+                err_msg = str(e)
+                # ─── REQUIREMENT 3: SMART RETRY FALLBACK (CRITICAL FAIL-SAFE) ───
+                log_msg = f"⚠️ [Groq API] API Error caught. Waiting 30s to retry... (Attempt {attempt}/{self.max_retries}, Error: {err_msg})"
+                if manager:
+                    manager.log(log_msg, level="WARNING")
+                else:
+                    logger.warning(log_msg)
 
-                choices = resp_data.get("choices", [])
-                if choices:
-                    raw_out = choices[0].get("message", {}).get("content", "").strip()
-                    translated_text = clean_translated_output(raw_out)
-
-            if manager and translated_text:
-                manager.log(f"✅ [Groq API] Translation received successfully ({len(translated_text.split())} words).")
-
-        except Exception as e:
-            if manager:
-                manager.log(f"⚠️ [Groq API] Request error: {e}", level="WARNING")
-
-        finally:
-            # ─── CRITICAL REQUIREMENT: SPEED BREAKER ───────────────────────
-            # You MUST add time.sleep(15) immediately after every single Groq API
-            # translation request to prevent 429 Rate Limit errors.
-            if manager:
-                manager.log("⏱️ [Speed Breaker] Pausing 15s after Groq API request to prevent 429 rate limits...")
-            time.sleep(15)
-
-        if translated_text and len(translated_text.strip()) >= 3:
-            return translated_text
+                if attempt < self.max_retries:
+                    # Wait 30s before retrying the exact same chunk
+                    for _ in range(30):
+                        if manager and manager.stop_event.is_set():
+                            raise KeyboardInterrupt("Job was cancelled by user.")
+                        time.sleep(1)
+                else:
+                    if manager:
+                        manager.log(
+                            f"⚠️ [Groq API] All {self.max_retries} attempts failed ({last_error}). "
+                            f"Using canonical anime lore fallback to preserve pipeline continuity.",
+                            level="WARNING"
+                        )
 
         return self._get_fallback(target_language)
 

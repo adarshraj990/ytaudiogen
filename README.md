@@ -1,43 +1,66 @@
-# 🎙️ Indic-F5 Audio Studio — Google Colab Edition (T4 GPU)
+# 🎙️ AudioGen Flow Studio — Neural Voice SRT Dubber (Google Colab Edition)
 
-A high-performance, batch-optimized, sentence-level audio dubbing studio powered by the **Indic-F5 (0.3B)** Hindi-English code-switched model and **FFmpeg silent canvas timeline alignment**.
+A high-performance, lightweight, sentence-level audio dubbing studio powered by ultra-fast neural speech synthesis and FFmpeg silent canvas timeline alignment.
+
+⚡ **100% Free of Hugging Face Dependencies — Zero Model Downloads, Zero VRAM Crashes, Zero Tokenizer/Pip Conflicts.**
 
 ---
 
-## ⚡ Core Architecture
+## 🚀 Key Features
 
-1. **Robust Synchronous SRT Parser**:
-   - Multi-encoding safe reader (`utf-8-sig`, `utf-8`, `latin-1`, `cp1252`, `iso-8859-1`, `utf-16`).
-   - Synchronous pre-flight validation catches empty, missing, or malformed subtitle files immediately with visible `gr.Warning` notifications.
-   - Eliminates silent background thread freezes.
+1. **Zero Hugging Face Footprint**:
+   - No `transformers`, `tokenizers`, `huggingface_hub`, or multi-gigabyte PyTorch weights.
+   - Installs in seconds in Google Colab without dependency resolver conflicts.
+   - Never runs out of GPU memory (VRAM).
 
-2. **Optimized Batch Inference (T4 GPU)**:
-   - Groups dialogue sentences into batches of **15–20** to maximize Google Colab T4 GPU VRAM utilization (**6–8 GB**).
-   - **Active OOM Fallback**: Catches CUDA out-of-memory errors, clears cache (`torch.cuda.empty_cache()`), halves the batch size, and immediately retries without crashing or skipping dialogue.
+2. **Ultra-Fast Neural Voice Synthesis**:
+   - Human-sounding neural voices for Hindi, Indian English, US English, and regional Indian languages (Bengali, Marathi, Tamil, Telugu, Urdu).
+   - Generates dialogue sentences concurrently in milliseconds.
 
 3. **FFmpeg Silent Canvas Alignment**:
-   - Creates a sample-accurate silent audio track matching the exact total video duration via `anullsrc`.
-   - Overlays each batched audio segment at its exact SRT `start_time` offset.
-   - Trims and pads timeline boundaries to guarantee a 1:1 match with original video length.
+   - Generates a silent base audio track of exact `total_duration` seconds.
+   - Overlays each dialogue chunk at its exact SRT `start_time` timestamp.
+   - Automatically pads or trims the timeline to guarantee an exact duration match with the original video.
 
-4. **Clean & Minimal UI**:
-   - Minimal Gradio Blocks interface with live progress monitoring and activity stream.
-   - Always launches with public share link enabled: `demo.launch(share=True)`.
+4. **Robust Set-and-Forget Job Manager**:
+   - Non-blocking daemon background processing.
+   - Live dashboard metrics, real-time activity log console, and instant progress tracking.
+   - Auto-purges stale/zombie states across Colab restarts.
+   - Includes a one-click **"🧹 Reset Standby"** button.
 
 ---
 
-## 🚀 Google Colab Quickstart
+## 💻 Google Colab Quickstart
 
-Copy and paste this snippet into your Google Colab cell (with T4 GPU runtime enabled):
+Run these commands in your Google Colab cell:
 
 ```bash
 # 1. Clone repository
 !git clone https://github.com/adarshraj990/ytaudiogen.git
 %cd ytaudiogen
 
-# 2. Install dependencies
+# 2. Install lightweight dependencies (Takes <10 seconds)
 !pip install -r requirements.txt
 
-# 3. Launch application
+# 3. Launch with public Gradio link
 !python app.py
 ```
+
+---
+
+## 🛠️ Supported Voices
+
+- **Hindi**:
+  - `Swara (Female, Natural & Expressive)` — `hi-IN-SwaraNeural`
+  - `Madhur (Male, Deep & Storyteller)` — `hi-IN-MadhurNeural`
+- **English**:
+  - `Neerja (Female, Indian Accent)` — `en-IN-NeerjaNeural`
+  - `Prabhat (Male, Indian Accent)` — `en-IN-PrabhatNeural`
+  - `Christopher (Male, Dynamic Narrator)` — `en-US-ChristopherNeural`
+  - `Jenny (Female, Conversational)` — `en-US-JennyNeural`
+- **Regional Languages**:
+  - `Bengali (Tanishaa)` — `bn-IN-TanishaaNeural`
+  - `Marathi (Aarohi)` — `mr-IN-AarohiNeural`
+  - `Tamil (Pallavi)` — `ta-IN-PallaviNeural`
+  - `Telugu (Shruti)` — `te-IN-ShrutiNeural`
+  - `Urdu (Uzma)` — `ur-PK-UzmaNeural`

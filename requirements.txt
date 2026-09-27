@@ -1,22 +1,16 @@
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-#  REQUIREMENTS — Google Colab (T4 GPU)
-#  Indic-F5 (0.3B) SRT-Driven Audio Dubber
+#  REQUIREMENTS — Google Colab & Local Studio
+#  Neural Voice SRT-Driven Audio Dubber (Zero Hugging Face Dependencies)
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-# Indic-F5 (0.3B) Core Engine & Neural Vocoder
-torchdiffeq>=0.2
-x-transformers>=1.30
-vocos
-safetensors>=0.4
-soundfile>=0.12.1
-librosa>=0.10
+# High-fidelity Neural TTS Engine (Zero Hugging Face dependencies, Zero model downloads)
+edge-tts>=7.0.0
 
-# Transformers & Tokenizers (Colab Compatible)
-transformers>=4.46.0
-tokenizers>=0.21.0
-
-# Audio Processing & Web UI Framework
+# Web Interface & UI Framework
 gradio
+
+# Audio Processing & Mixing
 pydub>=0.25.1
+soundfile>=0.12.1
 numpy
 requests

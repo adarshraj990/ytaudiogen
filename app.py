@@ -1200,9 +1200,5 @@ with gr.Blocks(title="Indic-F5 Colab Studio") as demo:
 if __name__ == "__main__":
     ensure_reference_audio()
     job_manager.reset_job()
-    print("\n🚀 Launching Indic-F5 Studio on Google Colab...")
-    print("🔗 Generating public Gradio share link, please wait 5-10 seconds...\n")
-    try:
-        demo.launch(share=True, css=CUSTOM_CSS, theme=gr.themes.Default())
-    except TypeError:
-        demo.launch(share=True)
+    demo.launch(share=True, theme=gr.themes.Default(), css=CUSTOM_CSS)
+

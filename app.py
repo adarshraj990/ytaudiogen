@@ -12,6 +12,12 @@ Core Systems:
 
 import os
 import sys
+
+# Disable all anonymous telemetry and unwanted pings
+os.environ["GRADIO_ANALYTICS_ENABLED"] = "False"
+os.environ["HF_HUB_DISABLE_TELEMETRY"] = "1"
+os.environ["HF_HUB_DISABLE_SYMLINKS_WARNING"] = "1"
+
 import gc
 import re
 import time
@@ -1043,7 +1049,8 @@ def reset_pipeline_handler():
 
 
 # ─── GRADIO BLOCKS APPLICATION ───────────────────────────────────────────────
-with gr.Blocks(theme=gr.themes.Default(), css=CUSTOM_CSS, title="Indic-F5 Colab Studio") as demo:
+with gr.Blocks(title="Indic-F5 Colab Studio") as demo:
+    gr.HTML(f"<style>{CUSTOM_CSS}</style>")
     # 1. Header Banner
     gr.HTML(
         """
@@ -1193,4 +1200,9 @@ with gr.Blocks(theme=gr.themes.Default(), css=CUSTOM_CSS, title="Indic-F5 Colab 
 if __name__ == "__main__":
     ensure_reference_audio()
     job_manager.reset_job()
-    demo.launch(share=True)
+    print("\n🚀 Launching Indic-F5 Studio on Google Colab...")
+    print("🔗 Generating public Gradio share link, please wait 5-10 seconds...\n")
+    try:
+        demo.launch(share=True, css=CUSTOM_CSS, theme=gr.themes.Default())
+    except TypeError:
+        demo.launch(share=True)

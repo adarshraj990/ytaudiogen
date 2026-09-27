@@ -12,9 +12,10 @@ librosa>=0.10
 soundfile>=0.12.1
 safetensors>=0.4
 
-# Core Transformers & Hugging Face Hub (pinned <4.45.0 for Gradio 4.44.1 compatibility)
-transformers>=4.40.0,<4.45.0
-huggingface_hub>=0.23.0,<1.0.0
+# Core Transformers, Tokenizers & Hugging Face Hub (Colab & Space compatibility)
+tokenizers>=0.21.0
+transformers>=4.46.0
+huggingface_hub>=0.23.0
 starlette<1.0.0
 pydantic<2.11.0
 

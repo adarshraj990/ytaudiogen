@@ -112,6 +112,35 @@ def ensure_reference_audio(ref_path: str = HARDCODED_REF_AUDIO, manager: Optiona
     return ref_path
 
 
+# ─── TOKENIZER VOCAB GUARANTEE (vocab.txt) ───────────────────────────────────
+VOCAB_FILE = "vocab.txt"
+
+def ensure_vocab_file(vocab_path: str = VOCAB_FILE, manager: Optional[Any] = None) -> str:
+    """Ensures vocab.txt exists in the working directory for Indic-F5 tokenizer."""
+    if os.path.exists(vocab_path) and os.path.getsize(vocab_path) > 1000:
+        return vocab_path
+
+    if manager:
+        manager.log(f"📝 [Tokenizer] Initializing Indic-F5 vocabulary file: {vocab_path}")
+
+    remote_vocab_url = f"https://huggingface.co/{INDIC_F5_MODEL_ID}/resolve/main/vocab.txt"
+    try:
+        req = urllib.request.Request(remote_vocab_url, headers={"User-Agent": "Mozilla/5.0"})
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            data = resp.read()
+            if len(data) > 1000:
+                with open(vocab_path, "wb") as f:
+                    f.write(data)
+                if manager:
+                    manager.log(f"✅ [Tokenizer] Downloaded vocab.txt from {INDIC_F5_MODEL_ID}")
+                return vocab_path
+    except Exception as e:
+        if manager:
+            manager.log(f"⚠️ [Tokenizer] Notice downloading vocab.txt: {e}", level="WARNING")
+
+    return vocab_path
+
+
 # ─── CORE SRT PARSING ENGINE ─────────────────────────────────────────────────
 def parse_srt(srt_file_or_content: str) -> List[Dict[str, Any]]:
     """Robust SRT parser extracting start_time, end_time, and clean text.
@@ -217,6 +246,7 @@ class IndicF5Generator:
                 return self.model
 
             ensure_reference_audio(self.ref_audio_path, manager=manager)
+            ensure_vocab_file(manager=manager)
 
             if manager:
                 manager.log(f"⏳ [Indic-F5] Loading 0.3B Indic-F5 model from '{self.model_id}'...")
@@ -1073,6 +1103,8 @@ with gr.Blocks(theme=gr.themes.Default(), css=CUSTOM_CSS, title="Indic-F5 Audio 
 # ─── APP ENTRYPOINT ────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     ensure_reference_audio()
+    ensure_vocab_file()
     demo.launch(share=True)
+
 
 

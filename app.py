@@ -36,6 +36,11 @@ import urllib.request
 from pathlib import Path
 from typing import List, Dict, Any, Tuple, Optional
 
+try:
+    import torch
+except ImportError:
+    torch = None
+
 import gradio as gr
 from pydub import AudioSegment
 
@@ -284,6 +289,153 @@ class IndicF5Generator:
 
             return self.model
 
+    def generate_batch(
+        self,
+        texts: List[str],
+        nfe_step: int = 32,
+        cfg_strength: float = 2.0,
+        sway_sampling_coef: float = -1.0,
+        speed: float = 1.0,
+        manager: Optional[Any] = None,
+    ) -> List[Optional[Tuple[Any, int]]]:
+        """Runs parallel batch DiT ODE inference on GPU/CPU to maximize VRAM utilization."""
+        model = self.model
+        if model is None or not texts:
+            return [None] * len(texts)
+
+        import numpy as np
+        import torch
+
+        with torch.inference_mode():
+            ref_audio = self.ref_audio_path
+            ref_text = self.ref_text.strip()
+            if not ref_text.endswith((" ", ".", "!", "?")):
+                ref_text += ". "
+
+            # 1. Load reference audio conditioning
+            cond, rms = model._load_ref(ref_audio)
+            HOP_LENGTH = 256
+            TARGET_RMS = 0.1
+            SAMPLE_RATE = 24000
+
+            ref_len = cond.shape[-1] // HOP_LENGTH
+            batch_size = len(texts)
+
+            # 2. Replicate cond across batch dimension (cond: [1, N] -> [B, N])
+            cond_batch = cond.repeat(batch_size, 1)
+
+            # 3. Calculate text duration tensor for each sentence
+            durations = []
+            full_texts = []
+            ref_byte_len = max(1, len(ref_text.encode("utf-8")))
+
+            for t in texts:
+                clean_t = t.strip()
+                full_texts.append(ref_text + clean_t)
+                t_byte_len = max(1, len(clean_t.encode("utf-8")))
+                dur = ref_len + int(ref_len / ref_byte_len * t_byte_len / speed)
+                durations.append(max(ref_len + 5, dur))
+
+            duration_tensor = torch.tensor(durations, device=cond.device, dtype=torch.long)
+
+            # 4. Neural ODE Flow-Matching Sample (All batch sentences in parallel)
+            generated, _ = model.model.sample(
+                cond=cond_batch,
+                text=full_texts,
+                duration=duration_tensor,
+                steps=nfe_step,
+                cfg_strength=cfg_strength,
+                sway_sampling_coef=sway_sampling_coef,
+            )
+
+            # 5. Extract, vocode and adjust individual waveforms
+            results = []
+            for i in range(batch_size):
+                try:
+                    dur_i = durations[i]
+                    mel_i = generated[i : i + 1, ref_len : dur_i, :].permute(0, 2, 1).to(torch.float32)
+                    wave_i = model.vocoder.decode(mel_i).squeeze().cpu()
+                    if rms < TARGET_RMS:
+                        wave_i = wave_i * rms / TARGET_RMS
+                    audio_arr = wave_i.numpy().astype(np.float32)
+                    results.append((audio_arr, SAMPLE_RATE))
+                except Exception as dec_err:
+                    if manager:
+                        manager.log(f"⚠️ [Indic-F5 Batch] Error decoding segment {i}: {dec_err}", level="WARNING")
+                    results.append(None)
+
+            return results
+
+    def synthesize_batch(
+        self,
+        batch_blocks: List[Dict[str, Any]],
+        manager: Optional[Any] = None,
+    ) -> List[Dict[str, Any]]:
+        """Synthesizes a batch of SRT subtitle blocks with GPU acceleration and 0 KB crash check."""
+        if not batch_blocks:
+            return []
+
+        ensure_reference_audio(self.ref_audio_path, manager=manager)
+        ensure_vocab_file(manager=manager)
+        model = self.load_model(manager=manager)
+
+        batch_texts = [b["text"].strip() for b in batch_blocks]
+        batch_results: Optional[List[Any]] = None
+
+        if model is not None:
+            try:
+                batch_results = self.generate_batch(batch_texts, manager=manager)
+            except torch.cuda.OutOfMemoryError:
+                if manager:
+                    manager.log("⚠️ [Indic-F5 GPU] CUDA OOM encountered. Flushing VRAM and splitting batch in half...", level="WARNING")
+                torch.cuda.empty_cache()
+                gc.collect()
+                if len(batch_blocks) > 1:
+                    mid = len(batch_blocks) // 2
+                    res1 = self.synthesize_batch(batch_blocks[:mid], manager=manager)
+                    res2 = self.synthesize_batch(batch_blocks[mid:], manager=manager)
+                    return res1 + res2
+                else:
+                    batch_results = None
+            except Exception as batch_err:
+                if manager:
+                    manager.log(f"⚠️ [Indic-F5 Batch] Notice during parallel generation: {batch_err}. Falling back to individual synthesis.", level="WARNING")
+                batch_results = None
+
+        # Process and verify generated files with 0 KB crash check
+        import soundfile as sf
+        successful_blocks = []
+
+        for i, block in enumerate(batch_blocks):
+            wav_path = block.get("wav_path", "")
+            os.makedirs(os.path.dirname(os.path.abspath(wav_path)), exist_ok=True)
+            written = False
+
+            if batch_results and i < len(batch_results) and batch_results[i] is not None:
+                audio_arr, sr = batch_results[i]
+                try:
+                    if os.path.exists(wav_path):
+                        os.remove(wav_path)
+                    sf.write(wav_path, audio_arr, sr)
+                    if os.path.exists(wav_path) and os.path.getsize(wav_path) > 1000:
+                        written = True
+                except Exception:
+                    written = False
+
+            # If parallel batch output failed for this item, trigger 1 individual retry
+            if not written:
+                written = self.synthesize_sentence(block["text"], wav_path, manager=manager)
+
+            if written and os.path.exists(wav_path) and os.path.getsize(wav_path) > 1000:
+                block_entry = dict(block)
+                block_entry["wav_path"] = wav_path
+                successful_blocks.append(block_entry)
+            else:
+                if manager:
+                    manager.log(f"⏩ [Skip Block] Sentence {block.get('index')} skipped after retry failed.", level="WARNING")
+
+        return successful_blocks
+
     def synthesize_sentence(
         self,
         text: str,
@@ -300,6 +452,7 @@ class IndicF5Generator:
             return False
 
         ensure_reference_audio(self.ref_audio_path, manager=manager)
+        ensure_vocab_file(manager=manager)
         os.makedirs(os.path.dirname(os.path.abspath(out_wav_path)), exist_ok=True)
 
         for attempt in range(2):
@@ -322,7 +475,7 @@ class IndicF5Generator:
                     )
                     sf.write(out_wav_path, audio, sr)
 
-                # Strategy 2: Resilient Local Fallback (Piper female voice) if model weights unavailable
+                # Strategy 2: Resilient Local Fallback (Piper/espeak) if model weights unavailable
                 if not (os.path.exists(out_wav_path) and os.path.getsize(out_wav_path) > 1000):
                     self._fallback_synthesis(text.strip(), out_wav_path, manager=manager)
 
@@ -352,10 +505,44 @@ class IndicF5Generator:
             pass
 
 
+# ─── BATCH SIZE & HARDWARE ACCELERATION HELPERS ──────────────────────────────
+def get_optimal_batch_size() -> int:
+    """Computes optimal batch size to push GPU VRAM utilization to ~8-10 GB on T4."""
+    import torch
+    if not torch.cuda.is_available():
+        return 2
+
+    try:
+        total_vram_gb = torch.cuda.get_device_properties(0).total_memory / (1024**3)
+        if total_vram_gb >= 14.0:  # e.g. T4 (15.3GB), V100 (16GB), A10 (24GB)
+            return 10  # Optimal for 8-10 GB VRAM utilization
+        elif total_vram_gb >= 8.0:
+            return 6
+        else:
+            return 4
+    except Exception:
+        return 8
+
+
+def get_vram_usage_str() -> str:
+    """Returns formatted VRAM usage string if CUDA is available."""
+    import torch
+    if not torch.cuda.is_available():
+        return ""
+    try:
+        reserved_gb = torch.cuda.memory_reserved(0) / (1024**3)
+        total_gb = torch.cuda.get_device_properties(0).total_memory / (1024**3)
+        pct = int(reserved_gb / total_gb * 100)
+        return f" | VRAM: {reserved_gb:.1f}/{total_gb:.1f} GB ({pct}%)"
+    except Exception:
+        return ""
+
+
 indic_f5_generator = IndicF5Generator(
     model_id=INDIC_F5_MODEL_ID,
     ref_audio_path=HARDCODED_REF_AUDIO,
 )
+
 
 
 # ─── TIME & DURATION CONVERSION UTILITIES ──────────────────────────────────
@@ -677,39 +864,68 @@ def run_indic_dubbing_worker(
         if manager.stop_event.is_set():
             raise KeyboardInterrupt("Job was cancelled by user.")
 
-        # 2. Sequential Indic-F5 Sentence Generation
+        # 2. High-Performance Indic-F5 Batch Processing (GPU Acceleration)
         manager.status = "GENERATING_TTS"
-        manager.log(f"🗣️ [Indic-F5] Beginning sentence-level generation with reference audio '{HARDCODED_REF_AUDIO}'...")
+        batch_size = get_optimal_batch_size()
+        vram_start = get_vram_usage_str()
+        manager.log(
+            f"⚡ [Indic-F5] Initializing Parallel Batch Inference (batch_size={batch_size}, "
+            f"Target VRAM: 8-10 GB){vram_start}"
+        )
+
+        # Pre-assign individual target destination filepaths to preserve 1:1 mapping with SRT block IDs
+        for idx, block in enumerate(blocks):
+            block["wav_path"] = os.path.join(SENTENCE_CHUNKS_DIR, f"sentence_{idx:04d}.wav")
+
+        # Partition dialogue segments into optimal batches
+        batches = [blocks[i : i + batch_size] for i in range(0, total_blocks, batch_size)]
+        total_batches = len(batches)
+        manager.log(f"📦 [Batch Planner] Partitioned {total_blocks} SRT sentences into {total_batches} parallel batches.")
 
         generated_blocks = []
-        for idx, block in enumerate(blocks):
+        processed_count = 0
+
+        for b_idx, batch in enumerate(batches):
             if manager.stop_event.is_set():
                 raise KeyboardInterrupt("Job was cancelled by user.")
 
-            manager.current_sentence = idx + 1
-            curr_progress = 10.0 + ((idx / total_blocks) * 75.0)
+            batch_start_idx = processed_count + 1
+            batch_end_idx = processed_count + len(batch)
+            curr_progress = 10.0 + ((processed_count / total_blocks) * 75.0)
             manager.progress = round(curr_progress, 1)
-            manager.message = f"Synthesizing sentence {idx + 1}/{total_blocks}: '{block['text'][:45]}...'"
+            manager.current_sentence = batch_end_idx
 
-            sentence_wav_path = os.path.join(SENTENCE_CHUNKS_DIR, f"sentence_{idx:04d}.wav")
-
-            # Indic-F5 (0.3B) inference with 0 KB crash check and 1 retry
-            success = indic_f5_generator.synthesize_sentence(
-                text=block["text"],
-                out_wav_path=sentence_wav_path,
-                manager=manager,
+            vram_current = get_vram_usage_str()
+            manager.message = (
+                f"Batch {b_idx + 1}/{total_batches} (sentences {batch_start_idx}-{batch_end_idx}/{total_blocks}) "
+                f"| Parallel GPU inference...{vram_current}"
+            )
+            manager.log(
+                f"⚡ [Batch {b_idx + 1}/{total_batches}] Generating {len(batch)} sentences "
+                f"(#{batch_start_idx} to #{batch_end_idx})...{vram_current}"
             )
 
-            if success and os.path.exists(sentence_wav_path) and os.path.getsize(sentence_wav_path) > 1000:
-                block_entry = dict(block)
-                block_entry["wav_path"] = sentence_wav_path
-                generated_blocks.append(block_entry)
-            else:
-                manager.log(f"⏩ [Skip Block] Sentence {idx + 1} skipped gracefully to preserve pipeline.", level="WARNING")
+            t0 = time.time()
+            # Batch synthesis executes parallel DiT ODE integration on GPU
+            batch_successes = indic_f5_generator.synthesize_batch(batch, manager=manager)
+            t_elapsed = time.time() - t0
 
-            # Periodic garbage collection to maintain low RAM usage
-            if (idx + 1) % 15 == 0:
+            generated_blocks.extend(batch_successes)
+            processed_count += len(batch)
+
+            manager.log(
+                f"✅ [Batch {b_idx + 1}/{total_batches}] Finished in {t_elapsed:.2f}s "
+                f"({len(batch_successes)}/{len(batch)} succeeded){get_vram_usage_str()}"
+            )
+
+            # Periodic garbage collection every 2 batches to maintain stable VRAM
+            if (b_idx + 1) % 2 == 0:
                 gc.collect()
+
+        # Strict Chronological Synchronization:
+        # Sort all generated blocks by start_time to guarantee exact timeline order
+        generated_blocks.sort(key=lambda b: (b.get("start_time", 0.0), b.get("index", 0)))
+        manager.log(f"🎯 [Audio Sync] {len(generated_blocks)}/{total_blocks} dialogue blocks chronologically synchronized.")
 
         if len(generated_blocks) == 0:
             raise RuntimeError("All sentence blocks failed synthesis. Could not produce any audio.")

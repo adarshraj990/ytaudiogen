@@ -147,89 +147,143 @@ def ensure_vocab_file(vocab_path: str = VOCAB_FILE, manager: Optional[Any] = Non
 
 
 # ─── CORE SRT PARSING ENGINE ─────────────────────────────────────────────────
+def read_srt_file_content(file_path: str) -> str:
+    """Reads subtitle file with automatic encoding detection (utf-8, utf-8-sig, utf-16, latin-1)."""
+    if not os.path.exists(file_path):
+        raise FileNotFoundError(f"Subtitle file not found on disk: '{os.path.basename(file_path)}'")
+
+    if os.path.getsize(file_path) == 0:
+        raise ValueError(f"Subtitle file '{os.path.basename(file_path)}' is empty (0 bytes).")
+
+    encodings = ["utf-8-sig", "utf-8", "utf-16", "utf-16-le", "utf-16-be", "latin-1", "cp1252"]
+    for enc in encodings:
+        try:
+            with open(file_path, "r", encoding=enc) as f:
+                text = f.read()
+            if "-->" in text:
+                return text
+        except (UnicodeDecodeError, UnicodeError):
+            continue
+        except Exception as e:
+            raise IOError(f"Could not read subtitle file: {e}")
+
+    # Fallback read with error replacement
+    try:
+        with open(file_path, "r", encoding="utf-8", errors="replace") as f:
+            return f.read()
+    except Exception as e:
+        raise IOError(f"Failed to read subtitle file '{os.path.basename(file_path)}': {e}")
+
+
 def parse_srt(srt_file_or_content: str) -> List[Dict[str, Any]]:
     """Robust SRT parser extracting start_time, end_time, and clean text.
     
-    Fail-safe:
-    - Skips any blocks where the text is empty or purely whitespace.
-    - Handles comma `,` and period `.` in millisecond timestamps.
-    - Strips formatting/HTML tags (<i>, <b>, <font>, etc.).
+    Guarantees:
+    - O(N) linear-time parsing with zero regex backtracking freezes.
+    - Automatic multi-encoding detection (utf-8, utf-8-sig, utf-16, latin-1).
+    - Descriptive exceptions for missing files, empty files, or invalid SRT syntax.
     """
-    if not srt_file_or_content:
-        return []
+    if not srt_file_or_content or not str(srt_file_or_content).strip():
+        raise ValueError("No subtitle file or content was provided.")
 
-    if os.path.exists(srt_file_or_content):
-        with open(srt_file_or_content, "r", encoding="utf-8", errors="replace") as f:
-            content = f.read()
-    else:
-        content = srt_file_or_content
+    try:
+        content = ""
+        # Check if it represents a file path
+        if isinstance(srt_file_or_content, str) and ("\n" not in srt_file_or_content or os.path.exists(srt_file_or_content)):
+            if not os.path.exists(srt_file_or_content):
+                raise FileNotFoundError(
+                    f"Subtitle file not found: '{os.path.basename(srt_file_or_content)}'. "
+                    "The file may have been moved or removed. Please re-upload your .srt file."
+                )
+            content = read_srt_file_content(srt_file_or_content)
+        else:
+            content = str(srt_file_or_content)
 
-    content = content.replace("\r\n", "\n").replace("\r", "\n")
+        if not content or not content.strip():
+            raise ValueError("The subtitle file is completely empty.")
 
-    def parse_timestamp(ts_str: str) -> float:
-        ts_clean = ts_str.strip().replace(",", ".")
-        parts = ts_clean.split(":")
-        if len(parts) == 3:
-            h = float(parts[0])
-            m = float(parts[1])
-            s = float(parts[2])
-            return h * 3600.0 + m * 60.0 + s
-        elif len(parts) == 2:
-            m = float(parts[0])
-            s = float(parts[1])
-            return m * 60.0 + s
-        return 0.0
+        content = content.replace("\r\n", "\n").replace("\r", "\n").strip()
 
-    blocks: List[Dict[str, Any]] = []
-    raw_blocks = re.split(r"\n\s*\n", content.strip())
+        if "-->" not in content:
+            raise ValueError(
+                "Invalid SRT format: Missing timestamp marker ('-->'). "
+                "Please verify that this is a valid SubRip (.srt) subtitle file."
+            )
 
-    for block in raw_blocks:
-        lines = [line.strip() for line in block.split("\n") if line.strip()]
-        if not lines:
-            continue
+        def parse_timestamp(ts_str: str) -> float:
+            ts_clean = ts_str.strip().replace(",", ".")
+            parts = ts_clean.split(":")
+            if len(parts) == 3:
+                h = float(parts[0])
+                m = float(parts[1])
+                s = float(parts[2])
+                return h * 3600.0 + m * 60.0 + s
+            elif len(parts) == 2:
+                m = float(parts[0])
+                s = float(parts[1])
+                return m * 60.0 + s
+            return 0.0
 
-        time_idx = -1
-        for i, line in enumerate(lines):
-            if "-->" in line:
-                time_idx = i
-                break
+        blocks: List[Dict[str, Any]] = []
+        raw_blocks = [b.strip() for b in content.split("\n\n") if b.strip()]
 
-        if time_idx == -1:
-            continue
-
-        try:
-            time_parts = lines[time_idx].split("-->")
-            start_sec = parse_timestamp(time_parts[0])
-            end_sec = parse_timestamp(time_parts[1])
-
-            text_lines = lines[time_idx + 1 :]
-            raw_text = " ".join(text_lines)
-
-            # Strip HTML/styling tags
-            clean_text = re.sub(r"<[^>]+>", "", raw_text).strip()
-            # Collapse internal whitespace
-            clean_text = " ".join(clean_text.split())
-
-            # Fail-safe: Skip any blocks where the text is empty or purely whitespace
-            if not clean_text:
+        for b_raw in raw_blocks:
+            lines = [line.strip() for line in b_raw.split("\n") if line.strip()]
+            if not lines:
                 continue
 
-            if end_sec <= start_sec:
-                end_sec = start_sec + max(1.0, len(clean_text) * 0.08)
+            time_idx = -1
+            for i, line in enumerate(lines):
+                if "-->" in line:
+                    time_idx = i
+                    break
 
-            blocks.append(
-                {
-                    "index": len(blocks) + 1,
-                    "start_time": round(start_sec, 3),
-                    "end_time": round(end_sec, 3),
-                    "duration": round(end_sec - start_sec, 3),
-                    "text": clean_text,
-                }
+            if time_idx == -1:
+                continue
+
+            try:
+                time_parts = lines[time_idx].split("-->")
+                if len(time_parts) < 2:
+                    continue
+                start_sec = parse_timestamp(time_parts[0])
+                end_sec = parse_timestamp(time_parts[1])
+
+                text_lines = lines[time_idx + 1 :]
+                raw_text = " ".join(text_lines)
+
+                # Strip HTML/styling tags (<i>, <b>, <font>, etc.)
+                clean_text = re.sub(r"<[^>]+>", "", raw_text).strip()
+                # Collapse internal whitespace
+                clean_text = " ".join(clean_text.split())
+
+                if not clean_text:
+                    continue
+
+                if end_sec <= start_sec:
+                    end_sec = start_sec + max(1.0, len(clean_text) * 0.08)
+
+                blocks.append(
+                    {
+                        "index": len(blocks) + 1,
+                        "start_time": round(start_sec, 3),
+                        "end_time": round(end_sec, 3),
+                        "duration": round(end_sec - start_sec, 3),
+                        "text": clean_text,
+                    }
+                )
+            except Exception:
+                continue
+
+        if not blocks:
+            raise ValueError(
+                "No valid subtitle blocks could be extracted. Please check that timestamps follow "
+                "standard SRT format (e.g., '00:00:01,000 --> 00:00:04,000')."
             )
-        except Exception:
-            continue
 
-    return blocks
+        return blocks
+
+    except Exception as e:
+        raise
 
 
 # ─── REQUIREMENT 1: INDIC-F5 (0.3B) GENERATION ENGINE ─────────────────────────
@@ -880,22 +934,42 @@ def run_indic_dubbing_worker(
         manager.message = "Parsing translated subtitle file (.srt)..."
         manager.save_to_disk()
 
-        blocks = parse_srt(srt_file_path)
-        total_blocks = len(blocks)
+        try:
+            if not srt_file_path:
+                raise ValueError("No subtitle file path was provided to the dubbing pipeline.")
 
-        if total_blocks == 0:
-            raise ValueError("No valid subtitle blocks found in the provided .srt file. Check format.")
+            if not os.path.exists(srt_file_path):
+                raise FileNotFoundError(f"Subtitle file '{os.path.basename(srt_file_path)}' was not found on disk.")
 
-        manager.total_sentences = total_blocks
-        manager.log(f"📝 [SRT Parser] Extracted {total_blocks} valid dialogue sentences.")
-        manager.progress = 10.0
-        manager.save_to_disk()
+            blocks = parse_srt(srt_file_path)
+            total_blocks = len(blocks)
+
+            if total_blocks == 0:
+                raise ValueError(f"No valid dialogue lines found in '{os.path.basename(srt_file_path)}'.")
+
+            manager.total_sentences = total_blocks
+            manager.log(f"📝 [SRT Parser] Extracted {total_blocks} valid dialogue sentences.")
+            manager.progress = 10.0
+            manager.message = f"Parsed {total_blocks} dialogue sentences. Preparing Indic-F5 engine..."
+            manager.save_to_disk()
+
+        except Exception as srt_err:
+            err_msg = f"SRT Parsing Error: {srt_err}"
+            manager.status = "FAILED"
+            manager.message = err_msg
+            manager.log(f"❌ {err_msg}", level="ERROR")
+            manager.end_time = time.time()
+            manager.save_to_disk()
+            return
 
         if manager.stop_event.is_set():
             raise KeyboardInterrupt("Job was cancelled by user.")
 
         # 2. High-Performance Indic-F5 Batch Processing (GPU Acceleration)
         manager.status = "GENERATING_TTS"
+        manager.progress = 12.0
+        manager.message = "Initializing Indic-F5 model & GPU memory allocator..."
+        manager.save_to_disk()
         batch_size = get_optimal_batch_size()
         vram_start = get_vram_usage_str()
         manager.log(
@@ -1084,16 +1158,16 @@ def extract_uploaded_path(file_obj: Any) -> Optional[str]:
         return None
     if isinstance(file_obj, str):
         path = file_obj.strip()
-        return path if path and os.path.exists(path) else None
-    if hasattr(file_obj, "name") and isinstance(file_obj.name, str) and os.path.exists(file_obj.name):
-        return file_obj.name
-    if hasattr(file_obj, "path") and isinstance(file_obj.path, str) and os.path.exists(file_obj.path):
-        return file_obj.path
+        return path if path else None
+    if hasattr(file_obj, "path") and isinstance(file_obj.path, str) and file_obj.path.strip():
+        return file_obj.path.strip()
+    if hasattr(file_obj, "name") and isinstance(file_obj.name, str) and file_obj.name.strip():
+        return file_obj.name.strip()
     if isinstance(file_obj, dict):
-        if "path" in file_obj and isinstance(file_obj["path"], str) and os.path.exists(file_obj["path"]):
-            return file_obj["path"]
-        if "name" in file_obj and isinstance(file_obj["name"], str) and os.path.exists(file_obj["name"]):
-            return file_obj["name"]
+        if "path" in file_obj and isinstance(file_obj["path"], str) and file_obj["path"].strip():
+            return file_obj["path"].strip()
+        if "name" in file_obj and isinstance(file_obj["name"], str) and file_obj["name"].strip():
+            return file_obj["name"].strip()
     if isinstance(file_obj, (list, tuple)) and len(file_obj) > 0:
         return extract_uploaded_path(file_obj[0])
     return None
@@ -1166,12 +1240,37 @@ def start_pipeline_handler(total_duration: Any, srt_file: Any):
     duration_val = parse_duration_to_seconds(total_duration)
 
     if not srt_path:
-        yield (
-            "<div style='color: #ef4444; background: rgba(239, 68, 68, 0.1); border: 1px solid #ef4444; border-radius: 8px; padding: 12px 16px; margin: 8px 0;'>"
-            "⚠️ <b>Please upload the Translated Subtitle File (.srt) first.</b>"
-            "</div>",
-            *get_dashboard_state()[1:],
-        )
+        gr.Warning("⚠️ Please upload the Translated Subtitle File (.srt) first.")
+        job_manager.status = "FAILED"
+        job_manager.message = "No subtitle file provided. Please upload a .srt file."
+        job_manager.save_to_disk()
+        yield get_dashboard_state()
+        return
+
+    # Check file exists and is readable on disk before starting worker
+    if not os.path.exists(srt_path):
+        err_msg = f"Subtitle file '{os.path.basename(srt_path)}' was not found on disk. Please re-upload your .srt file."
+        gr.Warning(f"❌ {err_msg}")
+        job_manager.status = "FAILED"
+        job_manager.message = err_msg
+        job_manager.log(f"❌ {err_msg}", level="ERROR")
+        job_manager.save_to_disk()
+        yield get_dashboard_state()
+        return
+
+    # Synchronous pre-flight validation of the SRT file
+    try:
+        test_blocks = parse_srt(srt_path)
+        if not test_blocks:
+            raise ValueError("No valid dialogue lines found in the uploaded subtitle file.")
+    except Exception as validation_err:
+        err_msg = f"SRT Validation Error: {validation_err}"
+        gr.Warning(f"❌ {err_msg}")
+        job_manager.status = "FAILED"
+        job_manager.message = err_msg
+        job_manager.log(f"❌ {err_msg}", level="ERROR")
+        job_manager.save_to_disk()
+        yield get_dashboard_state()
         return
 
     success, msg = job_manager.start_job(
@@ -1179,6 +1278,7 @@ def start_pipeline_handler(total_duration: Any, srt_file: Any):
         srt_file_path=srt_path,
     )
     if not success:
+        gr.Warning(f"⚠️ {msg}")
         yield get_dashboard_state()
         return
 
@@ -1188,6 +1288,8 @@ def start_pipeline_handler(total_duration: Any, srt_file: Any):
         state = get_dashboard_state()
         yield state
         if job_manager.status in ["COMPLETED", "FAILED", "CANCELLED"]:
+            if job_manager.status == "FAILED":
+                gr.Warning(f"❌ Pipeline Failed: {job_manager.message}")
             break
         time.sleep(1.0)
 

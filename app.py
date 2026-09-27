@@ -308,6 +308,10 @@ class IndicF5Generator:
             ensure_vocab_file(manager=manager)
 
             if manager:
+                manager.status = "GENERATING_TTS"
+                manager.progress = 12.0
+                manager.message = "Loading Indic-F5 (0.3B) model from Hugging Face..."
+                manager.save_to_disk()
                 manager.log(f"⏳ [Indic-F5] Loading 0.3B Indic-F5 model from '{self.model_id}'...")
 
             try:
@@ -335,6 +339,8 @@ class IndicF5Generator:
                     pass
 
                 if manager:
+                    manager.message = f"Indic-F5 model ready on {device.upper()}. Starting parallel inference..."
+                    manager.save_to_disk()
                     manager.log(f"✅ [Indic-F5] Indic-F5 0.3B model loaded successfully on {device.upper()}.")
             except Exception as e:
                 if manager:
@@ -861,16 +867,47 @@ class JobManager:
         return True, f"Indic-F5 dubbing job started (ID: {self.job_id})."
 
     def cancel_job(self) -> Tuple[bool, str]:
-        """Signals background worker to halt gracefully."""
+        """Signals background worker to halt gracefully, or resets zombie state."""
         with self.lock:
-            if not self.worker_thread or not self.worker_thread.is_alive():
-                return False, "No active job is currently running."
-            self.stop_event.set()
-            self.status = "CANCELLED"
-            self.message = "Cancellation requested by user. Terminating..."
-        self.log("Cancellation signal emitted by user.", level="WARNING")
-        self.save_to_disk()
-        return True, "Cancellation signal sent."
+            if self.worker_thread and self.worker_thread.is_alive():
+                self.stop_event.set()
+                self.status = "CANCELLED"
+                self.message = "Cancellation requested by user. Terminating..."
+                self.log("Cancellation signal emitted by user.", level="WARNING")
+                self.save_to_disk()
+                return True, "Cancellation signal sent."
+            else:
+                # Force reset any stale/zombie state so the user is never stuck
+                self.status = "IDLE"
+                self.progress = 0.0
+                self.job_id = None
+                self.message = "System Standby — Enter Total Duration and upload Translated SRT to start."
+                self.current_sentence = 0
+                self.total_sentences = 0
+                self.start_time = None
+                self.end_time = None
+                self.log("Job state reset to Standby.", level="INFO")
+                self.save_to_disk()
+                return True, "Job state reset to Standby."
+
+    def reset_job(self) -> Tuple[bool, str]:
+        """Force resets the entire job manager state to fresh clean IDLE standby."""
+        with self.lock:
+            if self.worker_thread and self.worker_thread.is_alive():
+                self.stop_event.set()
+            self.job_id = None
+            self.status = "IDLE"
+            self.progress = 0.0
+            self.message = "System Standby — Enter Total Duration and upload Translated SRT to start."
+            self.current_sentence = 0
+            self.total_sentences = 0
+            self.completed_file = None
+            self.logs = []
+            self.start_time = None
+            self.end_time = None
+            self.worker_thread = None
+            self.save_to_disk()
+            return True, "System reset to Standby."
 
     def get_state(self) -> Dict[str, Any]:
         with self.lock:
@@ -902,12 +939,26 @@ class JobManager:
             if os.path.exists(JOB_STATE_FILE):
                 with open(JOB_STATE_FILE, "r", encoding="utf-8") as f:
                     data = json.load(f)
-                    self.job_id = data.get("job_id")
-                    self.status = data.get("status", "IDLE")
-                    self.progress = data.get("progress", 0.0)
-                    self.message = data.get("message", "System Standby.")
-                    self.completed_file = data.get("completed_file")
-                    self.logs = data.get("logs", [])
+                    saved_status = data.get("status", "IDLE")
+                    # If server was restarted while a job was in progress, it is dead
+                    if saved_status in ["STARTING", "PARSING_SRT", "GENERATING_TTS", "SYNCING_AUDIO"]:
+                        self.job_id = None
+                        self.status = "IDLE"
+                        self.progress = 0.0
+                        self.message = "System Standby — Enter Total Duration and upload Translated SRT to start."
+                        self.current_sentence = 0
+                        self.total_sentences = 0
+                        self.completed_file = None
+                        self.logs = []
+                        self.start_time = None
+                        self.end_time = None
+                    else:
+                        self.job_id = data.get("job_id")
+                        self.status = saved_status
+                        self.progress = data.get("progress", 0.0)
+                        self.message = data.get("message", "System Standby.")
+                        self.completed_file = data.get("completed_file")
+                        self.logs = data.get("logs", [])
         except Exception:
             pass
 
@@ -1175,6 +1226,20 @@ def extract_uploaded_path(file_obj: Any) -> Optional[str]:
 
 def get_dashboard_state() -> Tuple[str, float, str, Optional[str], Any, Any]:
     """Builds snapshot of pipeline state for the Gradio dashboard."""
+    with job_manager.lock:
+        if job_manager.status in ["STARTING", "PARSING_SRT", "GENERATING_TTS", "SYNCING_AUDIO"]:
+            if not job_manager.worker_thread or not job_manager.worker_thread.is_alive():
+                # Zombie job from a past session / server reboot! Auto-reset to IDLE
+                job_manager.status = "IDLE"
+                job_manager.progress = 0.0
+                job_manager.job_id = None
+                job_manager.message = "System Standby — Enter Total Duration and upload Translated SRT to start."
+                job_manager.current_sentence = 0
+                job_manager.total_sentences = 0
+                job_manager.start_time = None
+                job_manager.end_time = None
+                job_manager.save_to_disk()
+
     state = job_manager.get_state()
     status = state["status"]
     progress = state["progress"]
@@ -1299,6 +1364,11 @@ def cancel_pipeline_handler():
     return get_dashboard_state()
 
 
+def reset_pipeline_handler():
+    job_manager.reset_job()
+    return get_dashboard_state()
+
+
 # ─── GRADIO APPLICATION LAYOUT ───────────────────────────────────────────────
 with gr.Blocks(theme=gr.themes.Default(), css=CUSTOM_CSS, title="Indic-F5 Audio Studio") as demo:
     # 1. Header Banner
@@ -1367,6 +1437,7 @@ with gr.Blocks(theme=gr.themes.Default(), css=CUSTOM_CSS, title="Indic-F5 Audio 
         start_btn = gr.Button("🚀 Generate Dubbed Audio", variant="primary", scale=3, elem_classes=["btn-launch-primary"])
         cancel_btn = gr.Button("⛔ Cancel Job", variant="stop", scale=1, interactive=False)
         refresh_btn = gr.Button("🔄 Refresh Status", variant="secondary", scale=1)
+        reset_btn = gr.Button("🧹 Reset Standby", variant="secondary", scale=1)
 
     # 3. Live Pipeline Status Deck & Progress Meter
     status_display = gr.HTML()
@@ -1433,6 +1504,13 @@ with gr.Blocks(theme=gr.themes.Default(), css=CUSTOM_CSS, title="Indic-F5 Audio 
         show_progress="hidden",
     )
 
+    reset_btn.click(
+        fn=reset_pipeline_handler,
+        inputs=[],
+        outputs=ui_outputs,
+        show_progress="hidden",
+    )
+
     auto_timer.tick(
         fn=get_dashboard_state,
         inputs=[],
@@ -1452,6 +1530,8 @@ with gr.Blocks(theme=gr.themes.Default(), css=CUSTOM_CSS, title="Indic-F5 Audio 
 if __name__ == "__main__":
     ensure_reference_audio()
     ensure_vocab_file()
+    # Auto-purge any stale/zombie job state from prior session
+    job_manager.reset_job()
     demo.launch(share=True)
 
 

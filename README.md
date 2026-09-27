@@ -1,35 +1,43 @@
----
-title: Audiogenflow
-emoji: 🎙️
-colorFrom: indigo
-colorTo: gray
-sdk: gradio
-sdk_version: 5.20.0
-python_version: 3.11
-app_file: app.py
-pinned: false
+# 🎙️ Indic-F5 Audio Studio — Google Colab Edition (T4 GPU)
+
+A high-performance, batch-optimized, sentence-level audio dubbing studio powered by the **Indic-F5 (0.3B)** Hindi-English code-switched model and **FFmpeg silent canvas timeline alignment**.
+
 ---
 
-# 🎙️ AudioGen Flow Studio — Indic-F5 (0.3B) SRT-Driven Audio Dubber
+## ⚡ Core Architecture
 
-A high-efficiency, offline, sentence-level audio dubbing studio powered by the **Indic-F5 (0.3B parameters)** Hindi-English code-switched model and FFmpeg silent canvas alignment.
+1. **Robust Synchronous SRT Parser**:
+   - Multi-encoding safe reader (`utf-8-sig`, `utf-8`, `latin-1`, `cp1252`, `iso-8859-1`, `utf-16`).
+   - Synchronous pre-flight validation catches empty, missing, or malformed subtitle files immediately with visible `gr.Warning` notifications.
+   - Eliminates silent background thread freezes.
 
-## 🚀 Architecture Highlights
-
-1. **Streamlined UI Inputs**:
-   - **Total Video Duration**: Exact duration (in seconds, numeric input with default 120s).
-   - **Translated Subtitle File**: Standard subtitle file (`.srt`).
-   - **Output**: Master dubbed audio file (`.wav`) matching the exact video timeline.
-
-2. **Indic-F5 (0.3B) Code-Switched Engine**:
-   - Model: [`Tharshan/indicf5_hindi-english_code_switch`](https://huggingface.co/Tharshan/indicf5_hindi-english_code_switch) (0.3B parameters).
-   - Specialized for Hindi-English code-switched (Hinglish) dialogue with natural Indian voice prosody.
-   - Hardcoded reference voice: `core_1_ours.wav`.
-   - Strict 0 KB crash check with automated single-retry before skipping any problematic block.
+2. **Optimized Batch Inference (T4 GPU)**:
+   - Groups dialogue sentences into batches of **15–20** to maximize Google Colab T4 GPU VRAM utilization (**6–8 GB**).
+   - **Active OOM Fallback**: Catches CUDA out-of-memory errors, clears cache (`torch.cuda.empty_cache()`), halves the batch size, and immediately retries without crashing or skipping dialogue.
 
 3. **FFmpeg Silent Canvas Alignment**:
-   - Generates a completely silent base canvas audio of exact `total_duration` seconds via `anullsrc`.
-   - Overlays each generated Indic-F5 sentence chunk at its exact SRT `start_time` offset.
-   - Trims and pads timeline boundaries to guarantee an exact match with the target video duration.
-   - Exports the combined master timeline as a single pristine `.wav` file.
+   - Creates a sample-accurate silent audio track matching the exact total video duration via `anullsrc`.
+   - Overlays each batched audio segment at its exact SRT `start_time` offset.
+   - Trims and pads timeline boundaries to guarantee a 1:1 match with original video length.
 
+4. **Clean & Minimal UI**:
+   - Minimal Gradio Blocks interface with live progress monitoring and activity stream.
+   - Always launches with public share link enabled: `demo.launch(share=True)`.
+
+---
+
+## 🚀 Google Colab Quickstart
+
+Copy and paste this snippet into your Google Colab cell (with T4 GPU runtime enabled):
+
+```bash
+# 1. Clone repository
+!git clone https://github.com/adarshraj990/ytaudiogen.git
+%cd ytaudiogen
+
+# 2. Install dependencies
+!pip install -r requirements.txt
+
+# 3. Launch application
+!python app.py
+```

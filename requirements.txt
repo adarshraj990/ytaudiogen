@@ -1,26 +1,22 @@
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-#  REQUIREMENTS — Hugging Face & Google Colab
-#  Indic-F5 (0.3B) SRT-Driven Audio Dubber (Tharshan/indicf5_hindi-english_code_switch)
+#  REQUIREMENTS — Google Colab (T4 GPU)
+#  Indic-F5 (0.3B) SRT-Driven Audio Dubber
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-# Indic-F5 (0.3B) Dependencies
-torch>=2.2
-torchaudio>=2.2
+# Indic-F5 (0.3B) Core Engine & Neural Vocoder
 torchdiffeq>=0.2
 x-transformers>=1.30
-librosa>=0.10
-soundfile>=0.12.1
+vocos
 safetensors>=0.4
+soundfile>=0.12.1
+librosa>=0.10
 
-# Core Transformers, Tokenizers & Hugging Face Hub (Unpinned for Colab/Modern Pip compatibility)
-tokenizers>=0.21.0
+# Transformers & Tokenizers (Colab Compatible)
 transformers>=4.46.0
-huggingface_hub>=0.23.2
+tokenizers>=0.21.0
 
-# Audio Processing, Web UI & Utilities
+# Audio Processing & Web UI Framework
 gradio
 pydub>=0.25.1
-piper-tts
 numpy
 requests
-vocos

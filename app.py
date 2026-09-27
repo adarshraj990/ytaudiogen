@@ -1,20 +1,12 @@
 #!/usr/bin/env python3
 """
-AudioGen Flow Studio — Indic-F5 (0.3B) SRT-Driven Audio Dubber
+AudioGen Flow Studio — Indic-F5 (0.3B) SRT-Driven Audio Dubber (Google Colab T4 Edition)
 ═══════════════════════════════════════════════════════════════════════════════
-Architecture:
-1. Inputs:
-   a) Total Video Duration (in seconds, numeric input with default 120)
-   b) Translated Subtitle File (.srt)
-   Output: The final mixed dubbed Audio file (.wav).
-2. Indic-F5 (0.3B) Engine:
-   - Model: `Tharshan/indicf5_hindi-english_code_switch` (0.3B parameters).
-   - Hardcoded Reference Audio: `core_1_ours.wav`.
-   - Sentence-level generation with 0 KB crash protection (1 retry).
-3. FFmpeg Silent Canvas Logic:
-   - Generates a completely silent base canvas audio of exact `total_duration` seconds via `anullsrc`.
-   - Overlays each Indic-F5 sentence chunk at its exact SRT `start_time` offset.
-   - Exports the combined timeline as a single pristine `.wav` file.
+Core Systems:
+1. Robust Synchronous SRT Parser (multi-encoding safe with instant gr.Warning)
+2. Optimized Batch Processing (15-20 sentences per batch on T4 GPU with dynamic OOM fallback)
+3. FFmpeg Silent Canvas Alignment (sample-accurate timeline overlay to exact total duration)
+4. Clean, minimal Gradio UI ending strictly with demo.launch(share=True)
 ═══════════════════════════════════════════════════════════════════════════════
 """
 
@@ -32,15 +24,12 @@ import shutil
 import logging
 import threading
 import subprocess
-import urllib.request
 from pathlib import Path
 from typing import List, Dict, Any, Tuple, Optional
 
-try:
-    import torch
-except ImportError:
-    torch = None
-
+import torch
+import soundfile as sf
+import numpy as np
 import gradio as gr
 from pydub import AudioSegment
 
@@ -50,7 +39,7 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(message)s",
     handlers=[logging.StreamHandler(sys.stdout)],
 )
-logger = logging.getLogger("IndicF5-Dubber")
+logger = logging.getLogger("Colab-IndicF5")
 
 # ─── DIRECTORIES & CONFIGURATION ─────────────────────────────────────────────
 STORAGE_DIR = "storage"
@@ -60,39 +49,19 @@ SENTENCE_CHUNKS_DIR = os.path.join(WORKSPACE_DIR, "sentence_chunks")
 JOB_STATE_FILE = os.path.join(STORAGE_DIR, "job_state.json")
 
 INDIC_F5_MODEL_ID = "Tharshan/indicf5_hindi-english_code_switch"
-HARDCODED_REF_AUDIO = "core_1_ours.wav"
-DEFAULT_REF_TEXT = "नमस्ते, मैं एक software engineer हूँ और machine learning projects पर काम करती हूँ।"
+REF_AUDIO_PATH = "core_1_ours.wav"
+REF_TEXT = "नमस्ते, मैं एक software engineer हूँ और machine learning projects पर काम करती हूँ।"
 
 for d in [STORAGE_DIR, WORKSPACE_DIR, OUTPUTS_DIR, SENTENCE_CHUNKS_DIR]:
     os.makedirs(d, exist_ok=True)
 
 
 # ─── REFERENCE AUDIO GUARANTEE (core_1_ours.wav) ──────────────────────────────
-def ensure_reference_audio(ref_path: str = HARDCODED_REF_AUDIO, manager: Optional[Any] = None) -> str:
-    """Ensures core_1_ours.wav exists. Downloads authentic sample or synthesizes if offline."""
+def ensure_reference_audio(ref_path: str = REF_AUDIO_PATH) -> str:
+    """Ensures reference voice audio exists. Synthesizes a clean female vocal formant if absent."""
     if os.path.exists(ref_path) and os.path.getsize(ref_path) > 5000:
         return ref_path
 
-    if manager:
-        manager.log(f"🎙️ [Ref Audio] Initializing default female reference audio: {ref_path}")
-
-    # Attempt 1: Download authentic sample from Tharshan's Hugging Face repository
-    remote_sample_url = f"https://huggingface.co/{INDIC_F5_MODEL_ID}/resolve/main/samples/core_1_ours.wav"
-    try:
-        req = urllib.request.Request(remote_sample_url, headers={"User-Agent": "Mozilla/5.0"})
-        with urllib.request.urlopen(req, timeout=15) as resp:
-            data = resp.read()
-            if len(data) > 10000:
-                with open(ref_path, "wb") as f:
-                    f.write(data)
-                if manager:
-                    manager.log(f"✅ [Ref Audio] Downloaded authentic sample from {INDIC_F5_MODEL_ID} ({len(data)//1024} KB)")
-                return ref_path
-    except Exception as dl_err:
-        if manager:
-            manager.log(f"ℹ️ [Ref Audio] Note on remote sample download: {dl_err}. Creating local voice formant.", level="INFO")
-
-    # Attempt 2: Clean harmonic female vocal formant simulation (24kHz)
     sr = 24000
     duration = 3.5
     n_samples = int(sr * duration)
@@ -113,529 +82,114 @@ def ensure_reference_audio(ref_path: str = HARDCODED_REF_AUDIO, manager: Optiona
             val = int(val * env * 32767 * 0.45)
             frames.extend(struct.pack("<h", val))
         wf.writeframes(frames)
-
     return ref_path
 
 
-# ─── TOKENIZER VOCAB GUARANTEE (vocab.txt) ───────────────────────────────────
-VOCAB_FILE = "vocab.txt"
+# ─── SYSTEM 1: ROBUST SYNCHRONOUS SRT PARSER (THE FIX) ────────────────────────
+def read_srt_bytes_multi_encoding(file_path: str) -> str:
+    """Reads subtitle file testing multiple encodings. Halts immediately if unreadable."""
+    if not file_path or not os.path.exists(file_path):
+        raise FileNotFoundError(f"Subtitle file '{os.path.basename(str(file_path))}' does not exist on disk.")
 
-def ensure_vocab_file(vocab_path: str = VOCAB_FILE, manager: Optional[Any] = None) -> str:
-    """Ensures vocab.txt exists in the working directory for Indic-F5 tokenizer."""
-    if os.path.exists(vocab_path) and os.path.getsize(vocab_path) > 1000:
-        return vocab_path
+    with open(file_path, "rb") as f:
+        raw_bytes = f.read()
 
-    if manager:
-        manager.log(f"📝 [Tokenizer] Initializing Indic-F5 vocabulary file: {vocab_path}")
-
-    remote_vocab_url = f"https://huggingface.co/{INDIC_F5_MODEL_ID}/resolve/main/vocab.txt"
-    try:
-        req = urllib.request.Request(remote_vocab_url, headers={"User-Agent": "Mozilla/5.0"})
-        with urllib.request.urlopen(req, timeout=15) as resp:
-            data = resp.read()
-            if len(data) > 1000:
-                with open(vocab_path, "wb") as f:
-                    f.write(data)
-                if manager:
-                    manager.log(f"✅ [Tokenizer] Downloaded vocab.txt from {INDIC_F5_MODEL_ID}")
-                return vocab_path
-    except Exception as e:
-        if manager:
-            manager.log(f"⚠️ [Tokenizer] Notice downloading vocab.txt: {e}", level="WARNING")
-
-    return vocab_path
-
-
-# ─── CORE SRT PARSING ENGINE ─────────────────────────────────────────────────
-def read_srt_file_content(file_path: str) -> str:
-    """Reads subtitle file with automatic encoding detection (utf-8, utf-8-sig, utf-16, latin-1)."""
-    if not os.path.exists(file_path):
-        raise FileNotFoundError(f"Subtitle file not found on disk: '{os.path.basename(file_path)}'")
-
-    if os.path.getsize(file_path) == 0:
+    if not raw_bytes or len(raw_bytes.strip()) == 0:
         raise ValueError(f"Subtitle file '{os.path.basename(file_path)}' is empty (0 bytes).")
 
-    encodings = ["utf-8-sig", "utf-8", "utf-16", "utf-16-le", "utf-16-be", "latin-1", "cp1252"]
+    encodings = ["utf-8-sig", "utf-8", "latin-1", "cp1252", "iso-8859-1", "utf-16"]
     for enc in encodings:
         try:
-            with open(file_path, "r", encoding=enc) as f:
-                text = f.read()
-            if "-->" in text:
-                return text
-        except (UnicodeDecodeError, UnicodeError):
+            return raw_bytes.decode(enc)
+        except (UnicodeDecodeError, LookupError):
             continue
-        except Exception as e:
-            raise IOError(f"Could not read subtitle file: {e}")
 
-    # Fallback read with error replacement
-    try:
-        with open(file_path, "r", encoding="utf-8", errors="replace") as f:
-            return f.read()
-    except Exception as e:
-        raise IOError(f"Failed to read subtitle file '{os.path.basename(file_path)}': {e}")
+    return raw_bytes.decode("utf-8", errors="replace")
 
 
-def parse_srt(srt_file_or_content: str) -> List[Dict[str, Any]]:
-    """Robust SRT parser extracting start_time, end_time, and clean text.
-    
-    Guarantees:
-    - O(N) linear-time parsing with zero regex backtracking freezes.
-    - Automatic multi-encoding detection (utf-8, utf-8-sig, utf-16, latin-1).
-    - Descriptive exceptions for missing files, empty files, or invalid SRT syntax.
+def parse_timestamp_seconds(ts_str: str) -> float:
+    """Parses SRT timestamp (HH:MM:SS,mmm or HH:MM:SS.mmm) into seconds."""
+    ts_str = ts_str.strip().replace(",", ".")
+    parts = ts_str.split(":")
+    if len(parts) == 3:
+        h = float(parts[0])
+        m = float(parts[1])
+        s = float(parts[2])
+        return h * 3600.0 + m * 60.0 + s
+    elif len(parts) == 2:
+        m = float(parts[0])
+        s = float(parts[1])
+        return m * 60.0 + s
+    return float(parts[0])
+
+
+def parse_srt_synchronous(srt_path: str) -> List[Dict[str, Any]]:
+    """Synchronous, multi-encoding safe SRT reader.
+    Guarantees immediate failure detection with clear error messages.
     """
-    if not srt_file_or_content or not str(srt_file_or_content).strip():
-        raise ValueError("No subtitle file or content was provided.")
+    if not srt_path:
+        raise ValueError("Please select or upload a valid Translated Subtitle (.srt) file.")
 
-    try:
-        content = ""
-        # Check if it represents a file path
-        if isinstance(srt_file_or_content, str) and ("\n" not in srt_file_or_content or os.path.exists(srt_file_or_content)):
-            if not os.path.exists(srt_file_or_content):
-                raise FileNotFoundError(
-                    f"Subtitle file not found: '{os.path.basename(srt_file_or_content)}'. "
-                    "The file may have been moved or removed. Please re-upload your .srt file."
-                )
-            content = read_srt_file_content(srt_file_or_content)
-        else:
-            content = str(srt_file_or_content)
+    content = read_srt_bytes_multi_encoding(srt_path)
+    blocks = []
+    raw_blocks = re.split(r"\r?\n\r?\n", content)
 
-        if not content or not content.strip():
-            raise ValueError("The subtitle file is completely empty.")
+    for block_str in raw_blocks:
+        lines = [l.strip() for l in block_str.splitlines() if l.strip()]
+        if not lines:
+            continue
 
-        content = content.replace("\r\n", "\n").replace("\r", "\n").strip()
+        time_idx = -1
+        for i, line in enumerate(lines):
+            if "-->" in line:
+                time_idx = i
+                break
 
-        if "-->" not in content:
-            raise ValueError(
-                "Invalid SRT format: Missing timestamp marker ('-->'). "
-                "Please verify that this is a valid SubRip (.srt) subtitle file."
-            )
+        if time_idx == -1:
+            continue
 
-        def parse_timestamp(ts_str: str) -> float:
-            ts_clean = ts_str.strip().replace(",", ".")
-            parts = ts_clean.split(":")
-            if len(parts) == 3:
-                h = float(parts[0])
-                m = float(parts[1])
-                s = float(parts[2])
-                return h * 3600.0 + m * 60.0 + s
-            elif len(parts) == 2:
-                m = float(parts[0])
-                s = float(parts[1])
-                return m * 60.0 + s
-            return 0.0
-
-        blocks: List[Dict[str, Any]] = []
-        raw_blocks = [b.strip() for b in content.split("\n\n") if b.strip()]
-
-        for b_raw in raw_blocks:
-            lines = [line.strip() for line in b_raw.split("\n") if line.strip()]
-            if not lines:
-                continue
-
-            time_idx = -1
-            for i, line in enumerate(lines):
-                if "-->" in line:
-                    time_idx = i
-                    break
-
-            if time_idx == -1:
-                continue
-
-            try:
-                time_parts = lines[time_idx].split("-->")
-                if len(time_parts) < 2:
-                    continue
-                start_sec = parse_timestamp(time_parts[0])
-                end_sec = parse_timestamp(time_parts[1])
-
-                text_lines = lines[time_idx + 1 :]
-                raw_text = " ".join(text_lines)
-
-                # Strip HTML/styling tags (<i>, <b>, <font>, etc.)
-                clean_text = re.sub(r"<[^>]+>", "", raw_text).strip()
-                # Collapse internal whitespace
-                clean_text = " ".join(clean_text.split())
-
-                if not clean_text:
-                    continue
-
-                if end_sec <= start_sec:
-                    end_sec = start_sec + max(1.0, len(clean_text) * 0.08)
-
-                blocks.append(
-                    {
-                        "index": len(blocks) + 1,
-                        "start_time": round(start_sec, 3),
-                        "end_time": round(end_sec, 3),
-                        "duration": round(end_sec - start_sec, 3),
-                        "text": clean_text,
-                    }
-                )
-            except Exception:
-                continue
-
-        if not blocks:
-            raise ValueError(
-                "No valid subtitle blocks could be extracted. Please check that timestamps follow "
-                "standard SRT format (e.g., '00:00:01,000 --> 00:00:04,000')."
-            )
-
-        return blocks
-
-    except Exception as e:
-        raise
-
-
-# ─── REQUIREMENT 1: INDIC-F5 (0.3B) GENERATION ENGINE ─────────────────────────
-class IndicF5Generator:
-    """Manages sentence-level Indic-F5 (0.3B) speech synthesis with 0 KB crash checks."""
-
-    def __init__(self, model_id: str = INDIC_F5_MODEL_ID, ref_audio_path: str = HARDCODED_REF_AUDIO):
-        self.model_id = model_id
-        self.ref_audio_path = ref_audio_path
-        self.ref_text = DEFAULT_REF_TEXT
-        self.model = None
-        self._lock = threading.Lock()
-        self.is_loaded = False
-
-    def load_model(self, manager: Optional[Any] = None):
-        """Loads Indic-F5 (0.3B) model from Hugging Face."""
-        with self._lock:
-            if self.is_loaded and self.model is not None:
-                return self.model
-
-            ensure_reference_audio(self.ref_audio_path, manager=manager)
-            ensure_vocab_file(manager=manager)
-
-            if manager:
-                manager.status = "GENERATING_TTS"
-                manager.progress = 12.0
-                manager.message = "Loading Indic-F5 (0.3B) model from Hugging Face..."
-                manager.save_to_disk()
-                manager.log(f"⏳ [Indic-F5] Loading 0.3B Indic-F5 model from '{self.model_id}'...")
-
-            try:
-                import torch
-                from transformers import AutoModel
-
-                device = "cuda" if torch.cuda.is_available() else "cpu"
-                model = AutoModel.from_pretrained(
-                    self.model_id,
-                    trust_remote_code=True,
-                )
-                model = model.to(device)
-                model.eval()
-                self.model = model
-                self.is_loaded = True
-
-                # Inspect default voice transcript if available
-                try:
-                    voices = list(model.voices())
-                    if "ritu_hinglish" in voices:
-                        _, transcript = model.voice("ritu_hinglish")
-                        if transcript and transcript.strip():
-                            self.ref_text = transcript.strip()
-                except Exception:
-                    pass
-
-                if manager:
-                    manager.message = f"Indic-F5 model ready on {device.upper()}. Starting parallel inference..."
-                    manager.save_to_disk()
-                    manager.log(f"✅ [Indic-F5] Indic-F5 0.3B model loaded successfully on {device.upper()}.")
-            except Exception as e:
-                if manager:
-                    manager.log(f"⚠️ [Indic-F5] AutoModel loader notice: {e}", level="WARNING")
-                self.model = None
-
-            return self.model
-
-    def generate_batch(
-        self,
-        texts: List[str],
-        nfe_step: int = 32,
-        cfg_strength: float = 2.0,
-        sway_sampling_coef: float = -1.0,
-        speed: float = 1.0,
-        manager: Optional[Any] = None,
-    ) -> List[Optional[Tuple[Any, int]]]:
-        """Runs parallel batch DiT ODE inference on GPU/CPU to maximize VRAM utilization."""
-        model = self.model
-        if model is None or not texts:
-            return [None] * len(texts)
-
-        import numpy as np
-        import torch
-
-        with torch.inference_mode():
-            ref_audio = self.ref_audio_path
-            ref_text = self.ref_text.strip()
-            if not ref_text.endswith((" ", ".", "!", "?")):
-                ref_text += ". "
-
-            # 1. Load reference audio conditioning
-            cond, rms = model._load_ref(ref_audio)
-            HOP_LENGTH = 256
-            TARGET_RMS = 0.1
-            SAMPLE_RATE = 24000
-
-            ref_len = cond.shape[-1] // HOP_LENGTH
-            batch_size = len(texts)
-
-            # 2. Replicate cond across batch dimension (cond: [1, N] -> [B, N])
-            cond_batch = cond.repeat(batch_size, 1)
-
-            # 3. Calculate text duration tensor for each sentence
-            durations = []
-            full_texts = []
-            ref_byte_len = max(1, len(ref_text.encode("utf-8")))
-
-            for t in texts:
-                clean_t = t.strip()
-                full_texts.append(ref_text + clean_t)
-                t_byte_len = max(1, len(clean_t.encode("utf-8")))
-                dur = ref_len + int(ref_len / ref_byte_len * t_byte_len / speed)
-                durations.append(max(ref_len + 5, dur))
-
-            duration_tensor = torch.tensor(durations, device=cond.device, dtype=torch.long)
-
-            # 4. Neural ODE Flow-Matching Sample (All batch sentences in parallel)
-            generated, _ = model.model.sample(
-                cond=cond_batch,
-                text=full_texts,
-                duration=duration_tensor,
-                steps=nfe_step,
-                cfg_strength=cfg_strength,
-                sway_sampling_coef=sway_sampling_coef,
-            )
-
-            # 5. Extract, vocode and adjust individual waveforms
-            results = []
-            for i in range(batch_size):
-                try:
-                    dur_i = durations[i]
-                    mel_i = generated[i : i + 1, ref_len : dur_i, :].permute(0, 2, 1).to(torch.float32)
-                    wave_i = model.vocoder.decode(mel_i).squeeze().cpu()
-                    if rms < TARGET_RMS:
-                        wave_i = wave_i * rms / TARGET_RMS
-                    audio_arr = wave_i.numpy().astype(np.float32)
-                    results.append((audio_arr, SAMPLE_RATE))
-                except Exception as dec_err:
-                    if manager:
-                        manager.log(f"⚠️ [Indic-F5 Batch] Error decoding segment {i}: {dec_err}", level="WARNING")
-                    results.append(None)
-
-            return results
-
-    def synthesize_batch(
-        self,
-        batch_blocks: List[Dict[str, Any]],
-        manager: Optional[Any] = None,
-    ) -> List[Dict[str, Any]]:
-        """Synthesizes a batch of SRT subtitle blocks with GPU acceleration and 0 KB crash check."""
-        if not batch_blocks:
-            return []
-
-        ensure_reference_audio(self.ref_audio_path, manager=manager)
-        ensure_vocab_file(manager=manager)
-        model = self.load_model(manager=manager)
-
-        batch_texts = [b["text"].strip() for b in batch_blocks]
-        batch_results: Optional[List[Any]] = None
-
-        if model is not None:
-            try:
-                batch_results = self.generate_batch(batch_texts, manager=manager)
-            except RuntimeError as e:
-                if "OutOfMemory" in str(e) or "CUDA out of memory" in str(e) or "out of memory" in str(e).lower():
-                    if manager:
-                        manager.log(
-                            f"⚠️ [Dynamic Memory Fallback] CUDA Out of Memory with batch size {len(batch_blocks)}. "
-                            f"Clearing cache and halving batch size to retry immediately...",
-                            level="WARNING",
-                        )
-                    if torch and hasattr(torch, "cuda") and torch.cuda.is_available():
-                        torch.cuda.empty_cache()
-                    gc.collect()
-
-                    if len(batch_blocks) > 1:
-                        mid = len(batch_blocks) // 2
-                        first_half = self.synthesize_batch(batch_blocks[:mid], manager=manager)
-                        second_half = self.synthesize_batch(batch_blocks[mid:], manager=manager)
-                        return first_half + second_half
-                    else:
-                        batch_results = None
-                else:
-                    if manager:
-                        manager.log(f"⚠️ [Indic-F5 Batch] RuntimeError during parallel generation: {e}", level="WARNING")
-                    batch_results = None
-            except Exception as batch_err:
-                if "OutOfMemory" in str(batch_err) or "CUDA out of memory" in str(batch_err) or "out of memory" in str(batch_err).lower():
-                    if manager:
-                        manager.log(
-                            f"⚠️ [Dynamic Memory Fallback] OOM encountered with batch size {len(batch_blocks)}. "
-                            f"Clearing cache and halving batch size to retry immediately...",
-                            level="WARNING",
-                        )
-                    if torch and hasattr(torch, "cuda") and torch.cuda.is_available():
-                        torch.cuda.empty_cache()
-                    gc.collect()
-
-                    if len(batch_blocks) > 1:
-                        mid = len(batch_blocks) // 2
-                        first_half = self.synthesize_batch(batch_blocks[:mid], manager=manager)
-                        second_half = self.synthesize_batch(batch_blocks[mid:], manager=manager)
-                        return first_half + second_half
-                    else:
-                        batch_results = None
-                else:
-                    if manager:
-                        manager.log(f"⚠️ [Indic-F5 Batch] Notice during parallel generation: {batch_err}. Falling back to individual synthesis.", level="WARNING")
-                    batch_results = None
-
-        # Process and verify generated files with 0 KB crash check
-        import soundfile as sf
-        successful_blocks = []
-
-        for i, block in enumerate(batch_blocks):
-            wav_path = block.get("wav_path", "")
-            os.makedirs(os.path.dirname(os.path.abspath(wav_path)), exist_ok=True)
-            written = False
-
-            if batch_results and i < len(batch_results) and batch_results[i] is not None:
-                audio_arr, sr = batch_results[i]
-                try:
-                    if os.path.exists(wav_path):
-                        os.remove(wav_path)
-                    sf.write(wav_path, audio_arr, sr)
-                    if os.path.exists(wav_path) and os.path.getsize(wav_path) > 1000:
-                        written = True
-                except Exception:
-                    written = False
-
-            # If parallel batch output failed for this item, trigger 1 individual retry
-            if not written:
-                written = self.synthesize_sentence(block["text"], wav_path, manager=manager)
-
-            if written and os.path.exists(wav_path) and os.path.getsize(wav_path) > 1000:
-                block_entry = dict(block)
-                block_entry["wav_path"] = wav_path
-                successful_blocks.append(block_entry)
-            else:
-                if manager:
-                    manager.log(f"⏩ [Skip Block] Sentence {block.get('index')} skipped after retry failed.", level="WARNING")
-
-        return successful_blocks
-
-    def synthesize_sentence(
-        self,
-        text: str,
-        out_wav_path: str,
-        manager: Optional[Any] = None,
-    ) -> bool:
-        """Synthesizes text for one sentence block using Indic-F5 (0.3B).
-        
-        CRITICAL FAIL-SAFE:
-        - Maintains 0 KB crash check.
-        - Skips the block if it fails after 1 retry.
-        """
-        if not text or not text.strip():
-            return False
-
-        ensure_reference_audio(self.ref_audio_path, manager=manager)
-        ensure_vocab_file(manager=manager)
-        os.makedirs(os.path.dirname(os.path.abspath(out_wav_path)), exist_ok=True)
-
-        for attempt in range(2):
-            try:
-                if os.path.exists(out_wav_path):
-                    try:
-                        os.remove(out_wav_path)
-                    except Exception:
-                        pass
-
-                # Strategy 1: Indic-F5 AutoModel Direct Inference
-                model = self.load_model(manager=manager)
-                if model is not None:
-                    import soundfile as sf
-                    ref_text_to_use = self.ref_text if (self.ref_text and self.ref_text.strip()) else DEFAULT_REF_TEXT
-                    audio, sr = model.generate(
-                        text=text.strip(),
-                        ref_audio=self.ref_audio_path,
-                        ref_text=ref_text_to_use,
-                    )
-                    sf.write(out_wav_path, audio, sr)
-
-                # Strategy 2: Resilient Local Fallback (Piper/espeak) if model weights unavailable
-                if not (os.path.exists(out_wav_path) and os.path.getsize(out_wav_path) > 1000):
-                    self._fallback_synthesis(text.strip(), out_wav_path, manager=manager)
-
-                # Maintain the 0 KB crash check
-                if os.path.exists(out_wav_path) and os.path.getsize(out_wav_path) > 1000:
-                    return True
-                else:
-                    if attempt == 0 and manager:
-                        manager.log(f"⚠️ [Indic-F5] Output was 0 KB for: '{text[:30]}...'. Retrying 1 time...", level="WARNING")
-                    time.sleep(0.3)
-
-            except Exception as err:
-                if attempt == 0 and manager:
-                    manager.log(f"⚠️ [Indic-F5] Attempt 1 error for: '{text[:30]}...': {err}. Retrying...", level="WARNING")
-                time.sleep(0.3)
-
-        if manager:
-            manager.log(f"⚠️ [Indic-F5] Block skipped after retry failed: '{text[:40]}...'", level="WARNING")
-        return False
-
-    def _fallback_synthesis(self, text: str, out_wav_path: str, manager: Optional[Any] = None):
-        """High-fidelity offline fallback if GPU/CPU weights are compiling."""
         try:
-            cmd = ["espeak-ng", "-w", out_wav_path, "-v", "hi", text]
-            subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=15)
+            time_parts = lines[time_idx].split("-->")
+            if len(time_parts) < 2:
+                continue
+            start_sec = parse_timestamp_seconds(time_parts[0])
+            end_sec = parse_timestamp_seconds(time_parts[1])
+
+            text_lines = lines[time_idx + 1 :]
+            raw_text = " ".join(text_lines)
+
+            # Clean styling tags and whitespace
+            clean_text = re.sub(r"<[^>]+>", "", raw_text).strip()
+            clean_text = " ".join(clean_text.split())
+
+            if not clean_text:
+                continue
+
+            if end_sec <= start_sec:
+                end_sec = start_sec + max(1.0, len(clean_text) * 0.08)
+
+            blocks.append(
+                {
+                    "index": len(blocks) + 1,
+                    "start_time": round(start_sec, 3),
+                    "end_time": round(end_sec, 3),
+                    "duration": round(end_sec - start_sec, 3),
+                    "text": clean_text,
+                }
+            )
         except Exception:
-            pass
+            continue
+
+    if not blocks:
+        raise ValueError(
+            f"No valid subtitle dialogue lines found in '{os.path.basename(srt_path)}'. "
+            "Please ensure the file follows standard SRT format (e.g., '00:00:01,000 --> 00:00:04,000')."
+        )
+
+    return blocks
 
 
-# ─── BATCH SIZE & HARDWARE ACCELERATION HELPERS ──────────────────────────────
-def get_optimal_batch_size() -> int:
-    """Computes aggressive batch size (35 on T4) to maximize GPU VRAM utilization to 70-80%."""
-    import torch
-    if not torch.cuda.is_available():
-        return 2
-
-    try:
-        total_vram_gb = torch.cuda.get_device_properties(0).total_memory / (1024**3)
-        if total_vram_gb >= 14.0:  # e.g. T4 (15.3GB), V100 (16GB), A10 (24GB)
-            return 35  # Aggressive batch size to force 70-80% GPU VRAM utilization
-        elif total_vram_gb >= 8.0:
-            return 16
-        else:
-            return 8
-    except Exception:
-        return 35
-
-
-def get_vram_usage_str() -> str:
-    """Returns formatted VRAM usage string if CUDA is available."""
-    import torch
-    if not torch.cuda.is_available():
-        return ""
-    try:
-        reserved_gb = torch.cuda.memory_reserved(0) / (1024**3)
-        total_gb = torch.cuda.get_device_properties(0).total_memory / (1024**3)
-        pct = int(reserved_gb / total_gb * 100)
-        return f" | VRAM: {reserved_gb:.1f}/{total_gb:.1f} GB ({pct}%)"
-    except Exception:
-        return ""
-
-
-indic_f5_generator = IndicF5Generator(
-    model_id=INDIC_F5_MODEL_ID,
-    ref_audio_path=HARDCODED_REF_AUDIO,
-)
-
-
-
-# ─── TIME & DURATION CONVERSION UTILITIES ──────────────────────────────────
+# ─── TIME & DURATION CONVERSION UTILITIES ────────────────────────────────────
 def parse_duration_to_seconds(dur_input: Any) -> float:
     """Parses duration from HH:MM:SS, MM:SS, seconds string, or numeric input into seconds."""
     if dur_input is None:
@@ -647,7 +201,6 @@ def parse_duration_to_seconds(dur_input: Any) -> float:
     if not s:
         return 120.0
 
-    # Format: HH:MM:SS or MM:SS
     if ":" in s:
         parts = s.split(":")
         try:
@@ -663,7 +216,6 @@ def parse_duration_to_seconds(dur_input: Any) -> float:
         except Exception:
             pass
 
-    # Format: Pure integer or float string
     try:
         val = float(s)
         return max(1.0, val)
@@ -682,30 +234,232 @@ def format_seconds_to_hms(seconds: float) -> str:
     return f"{h:02d}:{m:02d}:{s:02d}"
 
 
-# ─── REQUIREMENT 3: FFMPEG SILENT CANVAS AUDIO SYNCING ───────────────────────
+# ─── SYSTEM 2: OPTIMIZED INDIC-F5 (0.3B) BATCH PROCESSING WITH OOM FALLBACK ──
+class IndicF5BatchEngine:
+    """High-performance batch inference engine for Indic-F5 (0.3B) on T4 GPU."""
+
+    def __init__(self, model_id: str = INDIC_F5_MODEL_ID, ref_audio_path: str = REF_AUDIO_PATH):
+        self.model_id = model_id
+        self.ref_audio_path = ref_audio_path
+        self.ref_text = REF_TEXT
+        self.model = None
+        self._lock = threading.Lock()
+        self.device = "cuda" if torch.cuda.is_available() else "cpu"
+
+    def load_model(self, log_fn=None):
+        """Loads Indic-F5 (0.3B) model into GPU memory."""
+        with self._lock:
+            if self.model is not None:
+                return self.model
+
+            ensure_reference_audio(self.ref_audio_path)
+            if log_fn:
+                log_fn(f"⏳ [Indic-F5] Loading 0.3B model onto {self.device.upper()} from '{self.model_id}'...")
+
+            from transformers import AutoModel
+            model = AutoModel.from_pretrained(
+                self.model_id,
+                trust_remote_code=True,
+            )
+            model = model.to(self.device).eval()
+            self.model = model
+
+            if log_fn:
+                vram_info = self.get_vram_status()
+                log_fn(f"✅ [Indic-F5] Model ready on {self.device.upper()}{vram_info}")
+
+            return self.model
+
+    def get_vram_status(self) -> str:
+        """Returns formatted GPU VRAM usage."""
+        if not torch.cuda.is_available():
+            return ""
+        try:
+            allocated = torch.cuda.memory_allocated(0) / (1024**3)
+            reserved = torch.cuda.memory_reserved(0) / (1024**3)
+            total = torch.cuda.get_device_properties(0).total_memory / (1024**3)
+            pct = int(reserved / total * 100)
+            return f" | VRAM: {reserved:.1f}/{total:.1f} GB ({pct}%)"
+        except Exception:
+            return ""
+
+    def generate_batch(self, texts: List[str], speed: float = 1.0) -> List[Optional[Tuple[np.ndarray, int]]]:
+        """Runs parallel neural flow-matching batch sampling on GPU."""
+        model = self.load_model()
+        if not texts:
+            return []
+
+        with torch.inference_mode():
+            ref_audio = self.ref_audio_path
+            ref_text = self.ref_text.strip()
+            if not ref_text.endswith((" ", ".", "!", "?")):
+                ref_text += ". "
+
+            cond, rms = model._load_ref(ref_audio)
+            HOP_LENGTH = 256
+            TARGET_RMS = 0.1
+            SAMPLE_RATE = 24000
+
+            ref_len = cond.shape[-1] // HOP_LENGTH
+            batch_size = len(texts)
+            cond_batch = cond.repeat(batch_size, 1)
+
+            durations = []
+            full_texts = []
+            ref_byte_len = max(1, len(ref_text.encode("utf-8")))
+
+            for t in texts:
+                clean_t = t.strip()
+                full_texts.append(ref_text + clean_t)
+                t_byte_len = max(1, len(clean_t.encode("utf-8")))
+                dur = ref_len + int(ref_len / ref_byte_len * t_byte_len / speed)
+                durations.append(max(ref_len + 5, dur))
+
+            duration_tensor = torch.tensor(durations, device=cond.device, dtype=torch.long)
+
+            generated, _ = model.model.sample(
+                cond=cond_batch,
+                text=full_texts,
+                duration=duration_tensor,
+                steps=32,
+                cfg_strength=2.0,
+                sway_sampling_coef=-1.0,
+            )
+
+            results = []
+            for i in range(batch_size):
+                try:
+                    dur_i = durations[i]
+                    mel_i = generated[i : i + 1, ref_len : dur_i, :].permute(0, 2, 1).to(torch.float32)
+                    wave_i = model.vocoder.decode(mel_i).squeeze().cpu()
+                    if rms < TARGET_RMS:
+                        wave_i = wave_i * rms / TARGET_RMS
+                    audio_arr = wave_i.numpy().astype(np.float32)
+                    results.append((audio_arr, SAMPLE_RATE))
+                except Exception:
+                    results.append(None)
+
+            return results
+
+    def synthesize_single_fallback(self, text: str, out_wav_path: str) -> bool:
+        """Single sentence synthesis fallback with 0 KB check."""
+        try:
+            model = self.load_model()
+            if model is None:
+                return False
+            audio, sr = model.generate(
+                text=text.strip(),
+                ref_audio=self.ref_audio_path,
+                ref_text=self.ref_text,
+            )
+            if os.path.exists(out_wav_path):
+                os.remove(out_wav_path)
+            sf.write(out_wav_path, audio, sr)
+            return os.path.exists(out_wav_path) and os.path.getsize(out_wav_path) > 1000
+        except Exception:
+            return False
+
+    def synthesize_batch_with_oom_fallback(
+        self,
+        batch_blocks: List[Dict[str, Any]],
+        log_fn=None,
+    ) -> List[Dict[str, Any]]:
+        """Synthesizes a batch of text segments. If CUDA OOM occurs:
+        1. Catches RuntimeError
+        2. Clears cache & calls gc.collect()
+        3. Halves batch size and recursively retries without crashing
+        """
+        if not batch_blocks:
+            return []
+
+        texts = [b["text"].strip() for b in batch_blocks]
+        batch_results = None
+
+        try:
+            batch_results = self.generate_batch(texts)
+        except RuntimeError as e:
+            err_str = str(e).lower()
+            if "out of memory" in err_str or "cuda out of memory" in err_str:
+                if log_fn:
+                    log_fn(
+                        f"⚠️ [OOM Fallback] CUDA Out of Memory with batch size {len(batch_blocks)}. "
+                        f"Clearing cache and halving batch to retry immediately..."
+                    )
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                gc.collect()
+
+                if len(batch_blocks) > 1:
+                    mid = len(batch_blocks) // 2
+                    first_half = self.synthesize_batch_with_oom_fallback(batch_blocks[:mid], log_fn=log_fn)
+                    second_half = self.synthesize_batch_with_oom_fallback(batch_blocks[mid:], log_fn=log_fn)
+                    return first_half + second_half
+                else:
+                    batch_results = None
+            else:
+                if log_fn:
+                    log_fn(f"⚠️ [RuntimeError] {e}")
+                batch_results = None
+        except Exception as e:
+            if log_fn:
+                log_fn(f"⚠️ [Inference Notice] {e}")
+            batch_results = None
+
+        successful_blocks = []
+        for i, block in enumerate(batch_blocks):
+            wav_path = block.get("wav_path", "")
+            written = False
+
+            if batch_results and i < len(batch_results) and batch_results[i] is not None:
+                audio_arr, sr = batch_results[i]
+                try:
+                    if os.path.exists(wav_path):
+                        os.remove(wav_path)
+                    sf.write(wav_path, audio_arr, sr)
+                    if os.path.exists(wav_path) and os.path.getsize(wav_path) > 1000:
+                        written = True
+                except Exception:
+                    written = False
+
+            # Single retry fallback if batch decode failed for this block
+            if not written:
+                written = self.synthesize_single_fallback(block["text"], wav_path)
+
+            if written and os.path.exists(wav_path) and os.path.getsize(wav_path) > 1000:
+                block_entry = dict(block)
+                block_entry["wav_path"] = wav_path
+                successful_blocks.append(block_entry)
+            else:
+                if log_fn:
+                    log_fn(f"⏩ [Skip Block] Sentence {block.get('index')} skipped after retry.")
+
+        return successful_blocks
+
+
+# ─── SYSTEM 3: FFMPEG SILENT CANVAS AUDIO SYNCING ────────────────────────────
 def build_silent_canvas_dubbed_audio(
     total_duration_sec: float,
     generated_blocks: List[Dict[str, Any]],
     final_output_path: str,
-    manager: Optional[Any] = None,
+    log_fn=None,
 ) -> str:
-    """Generates a silent base track of exact `total_duration` seconds via FFmpeg anullsrc,
-    overlays generated Indic-F5 sentence chunks at their respective SRT start_time, and exports .wav.
+    """Generates silent base audio track of exact total_duration_sec via FFmpeg anullsrc,
+    overlays generated dialogue chunks at their exact SRT start_time, and exports pristine master .wav.
     """
     total_duration_sec = max(1.0, float(total_duration_sec))
     total_duration_ms = int(total_duration_sec * 1000)
     hms_str = format_seconds_to_hms(total_duration_sec)
 
-    if manager:
-        manager.log(f"🔇 [Silent Canvas] Generating {hms_str} ({total_duration_sec:.1f}s) silent canvas base via FFmpeg anullsrc...")
+    if log_fn:
+        log_fn(f"🔇 [Silent Canvas] Generating {hms_str} ({total_duration_sec:.1f}s) base silent canvas via FFmpeg anullsrc...")
 
     os.makedirs(WORKSPACE_DIR, exist_ok=True)
     os.makedirs(os.path.dirname(os.path.abspath(final_output_path)), exist_ok=True)
 
     silent_base_path = os.path.join(WORKSPACE_DIR, "silent_base_track.wav")
 
-    # 1. Use FFmpeg to generate completely silent audio track of exact total_duration
-    ffmpeg_silent_cmd = [
+    # 1. Generate exact silent canvas with FFmpeg
+    ffmpeg_cmd = [
         "ffmpeg",
         "-y",
         "-f", "lavfi",
@@ -715,25 +469,24 @@ def build_silent_canvas_dubbed_audio(
         silent_base_path,
     ]
 
-    silent_created = False
+    silent_ok = False
     try:
-        res = subprocess.run(ffmpeg_silent_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=30)
+        subprocess.run(ffmpeg_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=30)
         if os.path.exists(silent_base_path) and os.path.getsize(silent_base_path) > 1000:
-            silent_created = True
-            if manager:
-                manager.log(f"✅ [Silent Canvas] FFmpeg created silent track: {os.path.basename(silent_base_path)} ({total_duration_sec:.1f}s)")
-    except Exception as ff_err:
-        if manager:
-            manager.log(f"ℹ️ [Silent Canvas] FFmpeg binary notice: {ff_err}. Generating silent track via pydub.", level="INFO")
+            silent_ok = True
+            if log_fn:
+                log_fn(f"✅ [Silent Canvas] Created base silent track ({total_duration_sec:.1f}s)")
+    except Exception:
+        pass
 
-    if not silent_created:
-        # Pydub fallback for silent base canvas
+    if not silent_ok:
+        # Pydub fallback
         silent_canvas = AudioSegment.silent(duration=total_duration_ms, frame_rate=44100)
         silent_canvas.export(silent_base_path, format="wav")
 
-    # 2. Overlay generated Indic-F5 audio chunks at their exact SRT start_time
-    if manager:
-        manager.log(f"⏱️ [Audio Sync] Overlaying {len(generated_blocks)} dialogue chunks onto the silent canvas...")
+    # 2. Overlay generated sentence chunks at exact SRT start_time
+    if log_fn:
+        log_fn(f"⏱️ [Audio Sync] Overlaying {len(generated_blocks)} dialogue chunks at exact SRT start times...")
 
     try:
         base_canvas = AudioSegment.from_file(silent_base_path)
@@ -746,38 +499,30 @@ def build_silent_canvas_dubbed_audio(
         start_time_sec = block.get("start_time", 0.0)
         start_ms = max(0, int(start_time_sec * 1000))
 
-        if start_ms >= total_duration_ms:
-            if manager:
-                manager.log(
-                    f"⚠️ [Audio Sync] Block {block.get('index')} start_time ({start_time_sec:.1f}s) "
-                    f"exceeds total duration ({total_duration_sec:.1f}s).",
-                    level="WARNING",
-                )
-
         if chunk_wav and os.path.exists(chunk_wav) and os.path.getsize(chunk_wav) > 1000:
             try:
                 chunk_seg = AudioSegment.from_file(chunk_wav)
                 base_canvas = base_canvas.overlay(chunk_seg, position=start_ms)
                 placed_count += 1
-            except Exception as place_err:
-                if manager:
-                    manager.log(f"⚠️ [Audio Sync] Notice placing block {block.get('index')}: {place_err}", level="WARNING")
+            except Exception as e:
+                if log_fn:
+                    log_fn(f"⚠️ [Audio Sync] Notice overlaying block {block.get('index')}: {e}")
 
-    # 3. Trim or pad to guarantee exact duration match with requested total_duration
+    # 3. Trim or pad to guarantee exact duration match
     if len(base_canvas) > total_duration_ms:
         base_canvas = base_canvas[:total_duration_ms]
     elif len(base_canvas) < total_duration_ms:
         pad = AudioSegment.silent(duration=total_duration_ms - len(base_canvas), frame_rate=base_canvas.frame_rate)
         base_canvas = base_canvas + pad
 
-    # 4. Export the final combined audio as a pristine .wav file
+    # 4. Export the combined master timeline
     base_canvas.export(final_output_path, format="wav")
 
-    if manager:
-        final_size_kb = os.path.getsize(final_output_path) // 1024
-        manager.log(f"✅ [Audio Sync] Master dubbed audio finalized: {os.path.basename(final_output_path)} ({final_size_kb} KB, {hms_str})")
+    if log_fn:
+        final_kb = os.path.getsize(final_output_path) // 1024
+        log_fn(f"✅ [Audio Sync] Master dubbed audio finalized: {os.path.basename(final_output_path)} ({final_kb} KB, {hms_str})")
 
-    # Cleanup temporary silent track
+    # Cleanup temporary silent base track
     if os.path.exists(silent_base_path):
         try:
             os.remove(silent_base_path)
@@ -789,7 +534,7 @@ def build_silent_canvas_dubbed_audio(
 
 # ─── JOB MANAGER (THREAD-SAFE BACKGROUND PROCESSING) ──────────────────────────
 class JobManager:
-    """Manages asynchronous Indic-F5 dubbing job with live status and persistence."""
+    """Manages asynchronous dubbing pipeline with persistence and live UI metrics."""
 
     def __init__(self):
         self.lock = threading.Lock()
@@ -826,48 +571,37 @@ class JobManager:
         self,
         total_duration: float,
         srt_file_path: str,
+        blocks: List[Dict[str, Any]],
     ) -> Tuple[bool, str]:
-        """Launches the background dubbing job in a detached daemon thread."""
+        """Launches the background dubbing pipeline."""
         with self.lock:
             if self.worker_thread and self.worker_thread.is_alive():
                 return False, "A dubbing task is already running in the background. Wait or cancel it first."
 
-            if total_duration <= 0:
-                return False, "Please specify a positive Total Video Duration in seconds."
-
-            if not srt_file_path or not os.path.exists(srt_file_path):
-                err_msg = "Please upload a valid Translated Subtitle file (.srt)."
-                self.log(f"❌ {err_msg}", level="ERROR")
-                return False, err_msg
-
             self.job_id = uuid.uuid4().hex[:8]
             self.status = "STARTING"
-            self.progress = 1.0
-            self.message = f"Initializing Indic-F5 dubbing job ({self.job_id})..."
+            self.progress = 5.0
+            self.message = f"Starting Indic-F5 dubbing job ({self.job_id})..."
             self.current_sentence = 0
-            self.total_sentences = 0
+            self.total_sentences = len(blocks)
             self.completed_file = None
             self.logs = []
             self.start_time = time.time()
             self.end_time = None
             self.stop_event.clear()
 
-        hms_str = format_seconds_to_hms(total_duration)
-        self.log(f"New Indic-F5 dubbing job registered (ID: {self.job_id})")
-        self.log(f"⏱️ Total Duration: {hms_str} ({total_duration:.1f}s) | 📝 Subtitles: {os.path.basename(srt_file_path)}")
-        self.save_to_disk()
+            self.worker_thread = threading.Thread(
+                target=run_colab_dubbing_worker,
+                args=(self, total_duration, srt_file_path, blocks),
+                daemon=True,
+            )
+            self.worker_thread.start()
 
-        self.worker_thread = threading.Thread(
-            target=run_indic_dubbing_worker,
-            args=(self, float(total_duration), srt_file_path),
-            daemon=True,
-            name=f"IndicDubber-{self.job_id}",
-        )
-        self.worker_thread.start()
-        return True, f"Indic-F5 dubbing job started (ID: {self.job_id})."
+        self.log(f"Dubbing job {self.job_id} launched for {len(blocks)} sentences ({format_seconds_to_hms(total_duration)})")
+        self.save_to_disk()
+        return True, f"Job started (ID: {self.job_id})."
 
     def cancel_job(self) -> Tuple[bool, str]:
-        """Signals background worker to halt gracefully, or resets zombie state."""
         with self.lock:
             if self.worker_thread and self.worker_thread.is_alive():
                 self.stop_event.set()
@@ -877,21 +611,10 @@ class JobManager:
                 self.save_to_disk()
                 return True, "Cancellation signal sent."
             else:
-                # Force reset any stale/zombie state so the user is never stuck
-                self.status = "IDLE"
-                self.progress = 0.0
-                self.job_id = None
-                self.message = "System Standby — Enter Total Duration and upload Translated SRT to start."
-                self.current_sentence = 0
-                self.total_sentences = 0
-                self.start_time = None
-                self.end_time = None
-                self.log("Job state reset to Standby.", level="INFO")
-                self.save_to_disk()
-                return True, "Job state reset to Standby."
+                self.reset_job()
+                return True, "System reset to Standby."
 
     def reset_job(self) -> Tuple[bool, str]:
-        """Force resets the entire job manager state to fresh clean IDLE standby."""
         with self.lock:
             if self.worker_thread and self.worker_thread.is_alive():
                 self.stop_event.set()
@@ -911,9 +634,11 @@ class JobManager:
 
     def get_state(self) -> Dict[str, Any]:
         with self.lock:
-            elapsed = 0
+            now = time.time()
             if self.start_time:
-                elapsed = int((self.end_time or time.time()) - self.start_time)
+                elapsed = int((self.end_time or now) - self.start_time)
+            else:
+                elapsed = 0
 
             return {
                 "job_id": self.job_id,
@@ -922,15 +647,16 @@ class JobManager:
                 "message": self.message,
                 "current_sentence": self.current_sentence,
                 "total_sentences": self.total_sentences,
+                "elapsed_sec": max(0, elapsed),
                 "completed_file": self.completed_file,
                 "logs": list(self.logs),
-                "elapsed_sec": elapsed,
             }
 
     def save_to_disk(self):
         try:
+            state = self.get_state()
             with open(JOB_STATE_FILE, "w", encoding="utf-8") as f:
-                json.dump(self.get_state(), f, indent=2)
+                json.dump(state, f, indent=2)
         except Exception:
             pass
 
@@ -940,7 +666,7 @@ class JobManager:
                 with open(JOB_STATE_FILE, "r", encoding="utf-8") as f:
                     data = json.load(f)
                     saved_status = data.get("status", "IDLE")
-                    # If server was restarted while a job was in progress, it is dead
+                    # Auto-reset any zombie job state across Colab cell restarts
                     if saved_status in ["STARTING", "PARSING_SRT", "GENERATING_TTS", "SYNCING_AUDIO"]:
                         self.job_id = None
                         self.status = "IDLE"
@@ -964,78 +690,48 @@ class JobManager:
 
 
 job_manager = JobManager()
+indic_engine = IndicF5BatchEngine()
 
 
 # ─── MASTER BACKGROUND WORKER PIPELINE ───────────────────────────────────────
-def run_indic_dubbing_worker(
+def run_colab_dubbing_worker(
     manager: JobManager,
     total_duration: float,
     srt_file_path: str,
+    blocks: List[Dict[str, Any]],
 ):
-    """Executes the Indic-F5 (0.3B) SRT-driven dubbing pipeline onto silent canvas."""
+    """Executes the optimized Indic-F5 batch pipeline for Google Colab."""
     try:
         hms_str = format_seconds_to_hms(total_duration)
+        total_blocks = len(blocks)
         manager.log("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
-        manager.log(f"🚀 Starting Indic-F5 (0.3B) Audio Dubbing Pipeline ({hms_str})")
+        manager.log(f"🚀 Starting Indic-F5 Batch Dubbing Pipeline ({hms_str})")
+        manager.log(f"📝 Subtitle file: {os.path.basename(srt_file_path)} ({total_blocks} dialogue lines)")
         manager.log("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
 
-        # 1. Parse SRT Subtitle File
-        manager.status = "PARSING_SRT"
-        manager.progress = 5.0
-        manager.message = "Parsing translated subtitle file (.srt)..."
+        # 1. Model Loading
+        manager.status = "GENERATING_TTS"
+        manager.progress = 10.0
+        manager.message = "Loading Indic-F5 (0.3B) model into T4 GPU..."
         manager.save_to_disk()
 
-        try:
-            if not srt_file_path:
-                raise ValueError("No subtitle file path was provided to the dubbing pipeline.")
-
-            if not os.path.exists(srt_file_path):
-                raise FileNotFoundError(f"Subtitle file '{os.path.basename(srt_file_path)}' was not found on disk.")
-
-            blocks = parse_srt(srt_file_path)
-            total_blocks = len(blocks)
-
-            if total_blocks == 0:
-                raise ValueError(f"No valid dialogue lines found in '{os.path.basename(srt_file_path)}'.")
-
-            manager.total_sentences = total_blocks
-            manager.log(f"📝 [SRT Parser] Extracted {total_blocks} valid dialogue sentences.")
-            manager.progress = 10.0
-            manager.message = f"Parsed {total_blocks} dialogue sentences. Preparing Indic-F5 engine..."
-            manager.save_to_disk()
-
-        except Exception as srt_err:
-            err_msg = f"SRT Parsing Error: {srt_err}"
-            manager.status = "FAILED"
-            manager.message = err_msg
-            manager.log(f"❌ {err_msg}", level="ERROR")
-            manager.end_time = time.time()
-            manager.save_to_disk()
-            return
+        indic_engine.load_model(log_fn=manager.log)
 
         if manager.stop_event.is_set():
             raise KeyboardInterrupt("Job was cancelled by user.")
 
-        # 2. High-Performance Indic-F5 Batch Processing (GPU Acceleration)
-        manager.status = "GENERATING_TTS"
-        manager.progress = 12.0
-        manager.message = "Initializing Indic-F5 model & GPU memory allocator..."
-        manager.save_to_disk()
-        batch_size = get_optimal_batch_size()
-        vram_start = get_vram_usage_str()
-        manager.log(
-            f"⚡ [Indic-F5] Initializing Aggressive Parallel Batch Inference (batch_size={batch_size}, "
-            f"Target VRAM: 70-80%){vram_start}"
-        )
+        # 2. Optimized Batch Processing (15-20 sentences on T4 GPU)
+        # Choose batch size 18 on GPU to push VRAM usage to 6-8 GB
+        batch_size = 18 if torch.cuda.is_available() else 2
+        vram_info = indic_engine.get_vram_status()
+        manager.log(f"⚡ [Batch Planner] Grouping {total_blocks} sentences into batches of {batch_size} (Target VRAM: 6-8GB){vram_info}")
 
-        # Pre-assign individual target destination filepaths to preserve 1:1 mapping with SRT block IDs
+        # Pre-assign destination paths for 1:1 timeline mapping
         for idx, block in enumerate(blocks):
             block["wav_path"] = os.path.join(SENTENCE_CHUNKS_DIR, f"sentence_{idx:04d}.wav")
 
-        # Partition dialogue segments into optimal batches
         batches = [blocks[i : i + batch_size] for i in range(0, total_blocks, batch_size)]
         total_batches = len(batches)
-        manager.log(f"📦 [Batch Planner] Partitioned {total_blocks} SRT sentences into {total_batches} parallel batches.")
 
         generated_blocks = []
         processed_count = 0
@@ -1046,23 +742,19 @@ def run_indic_dubbing_worker(
 
             batch_start_idx = processed_count + 1
             batch_end_idx = processed_count + len(batch)
-            curr_progress = 10.0 + ((processed_count / total_blocks) * 75.0)
+            curr_progress = 12.0 + ((processed_count / total_blocks) * 73.0)
             manager.progress = round(curr_progress, 1)
             manager.current_sentence = batch_end_idx
 
-            vram_current = get_vram_usage_str()
+            vram_now = indic_engine.get_vram_status()
             manager.message = (
                 f"Batch {b_idx + 1}/{total_batches} (sentences {batch_start_idx}-{batch_end_idx}/{total_blocks}) "
-                f"| Parallel GPU inference...{vram_current}"
+                f"| T4 GPU Inference...{vram_now}"
             )
-            manager.log(
-                f"⚡ [Batch {b_idx + 1}/{total_batches}] Generating {len(batch)} sentences "
-                f"(#{batch_start_idx} to #{batch_end_idx})...{vram_current}"
-            )
+            manager.save_to_disk()
 
             t0 = time.time()
-            # Batch synthesis executes parallel DiT ODE integration on GPU
-            batch_successes = indic_f5_generator.synthesize_batch(batch, manager=manager)
+            batch_successes = indic_engine.synthesize_batch_with_oom_fallback(batch, log_fn=manager.log)
             t_elapsed = time.time() - t0
 
             generated_blocks.extend(batch_successes)
@@ -1070,17 +762,17 @@ def run_indic_dubbing_worker(
 
             manager.log(
                 f"✅ [Batch {b_idx + 1}/{total_batches}] Finished in {t_elapsed:.2f}s "
-                f"({len(batch_successes)}/{len(batch)} succeeded){get_vram_usage_str()}"
+                f"({len(batch_successes)}/{len(batch)} ok){indic_engine.get_vram_status()}"
             )
 
-            # Periodic garbage collection every 2 batches to maintain stable VRAM
-            if (b_idx + 1) % 2 == 0:
+            # Prevent memory fragmentation
+            if (b_idx + 1) % 2 == 0 and torch.cuda.is_available():
+                torch.cuda.empty_cache()
                 gc.collect()
 
-        # Strict Chronological Synchronization:
-        # Sort all generated blocks by start_time to guarantee exact timeline order
+        # Sort blocks chronologically by start_time
         generated_blocks.sort(key=lambda b: (b.get("start_time", 0.0), b.get("index", 0)))
-        manager.log(f"🎯 [Audio Sync] {len(generated_blocks)}/{total_blocks} dialogue blocks chronologically synchronized.")
+        manager.log(f"🎯 [Audio Sync] {len(generated_blocks)}/{total_blocks} dialogue blocks ready for timeline alignment.")
 
         if len(generated_blocks) == 0:
             raise RuntimeError("All sentence blocks failed synthesis. Could not produce any audio.")
@@ -1088,10 +780,10 @@ def run_indic_dubbing_worker(
         if manager.stop_event.is_set():
             raise KeyboardInterrupt("Job was cancelled by user.")
 
-        # 3. FFmpeg Silent Canvas Audio Syncing
+        # 3. FFmpeg Silent Canvas Alignment
         manager.status = "SYNCING_AUDIO"
-        manager.progress = 90.0
-        manager.message = f"Overlaying audio chunks onto {total_duration:.1f}s FFmpeg silent canvas..."
+        manager.progress = 88.0
+        manager.message = f"Overlaying audio segments onto {total_duration:.1f}s silent canvas..."
         manager.save_to_disk()
 
         timestamp_tag = time.strftime("%Y%m%d_%H%M%S")
@@ -1102,13 +794,13 @@ def run_indic_dubbing_worker(
             total_duration_sec=total_duration,
             generated_blocks=generated_blocks,
             final_output_path=final_wav_path,
-            manager=manager,
+            log_fn=manager.log,
         )
 
         if not (os.path.exists(final_wav_path) and os.path.getsize(final_wav_path) > 5000):
             raise RuntimeError("Final mixed audio file was not generated or is empty.")
 
-        # 4. Storage Cleanup: Clean temporary sentence chunk files
+        # 4. Storage Cleanup: Purge temporary chunks
         try:
             deleted_count = 0
             for f in Path(SENTENCE_CHUNKS_DIR).glob("*.wav"):
@@ -1128,7 +820,7 @@ def run_indic_dubbing_worker(
         manager.end_time = time.time()
         elapsed_min = (manager.end_time - manager.start_time) / 60.0
         manager.message = f"Master Dubbed Audio created successfully in {elapsed_min:.1f} minutes!"
-        manager.log(f"🎉 Indic-F5 dubbing finished successfully in {elapsed_min:.1f} minutes: {final_wav_filename}")
+        manager.log(f"🎉 Dubbing finished successfully in {elapsed_min:.1f} minutes: {final_wav_filename}")
         manager.save_to_disk()
 
     except KeyboardInterrupt:
@@ -1146,24 +838,31 @@ def run_indic_dubbing_worker(
         manager.save_to_disk()
 
     finally:
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
         gc.collect()
 
 
-# ─── GRADIO 4.44.1 UI INTERFACE ──────────────────────────────────────────────
+# ─── SYSTEM 4: CLEAN GRADIO UI ───────────────────────────────────────────────
 CUSTOM_CSS = """
-/* Clean, Minimal Professional Theme */
+:root {
+    --bg-primary: #0a0f1d;
+    --card-bg: rgba(15, 23, 42, 0.75);
+    --border-subtle: rgba(255, 255, 255, 0.08);
+}
+
 .gradio-container {
-    max-width: 1200px !important;
+    max-width: 1100px !important;
     margin: 0 auto !important;
-    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif !important;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif !important;
 }
 
 .studio-panel {
     border-radius: 12px !important;
-    border: 1px solid var(--border-color-primary, #e2e8f0) !important;
-    padding: 18px !important;
-    margin-bottom: 16px !important;
-    background: var(--background-fill-primary, #ffffff);
+    border: 1px solid var(--border-color-primary, #334155) !important;
+    padding: 16px !important;
+    margin-bottom: 14px !important;
+    background: var(--background-fill-primary, #1e293b);
 }
 
 .btn-launch-primary {
@@ -1173,19 +872,13 @@ CUSTOM_CSS = """
 }
 
 .fixed-log-console textarea {
-    height: 220px !important;
-    max-height: 220px !important;
-    min-height: 220px !important;
+    height: 200px !important;
+    max-height: 200px !important;
+    min-height: 200px !important;
     overflow-y: auto !important;
     resize: none !important;
-    font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace !important;
+    font-family: ui-monospace, SFMono-Regular, monospace !important;
     font-size: 0.84rem !important;
-    line-height: 1.45 !important;
-}
-
-.status-summary-card {
-    min-height: 56px;
-    box-sizing: border-box;
 }
 
 @keyframes pulseDot {
@@ -1215,9 +908,9 @@ def extract_uploaded_path(file_obj: Any) -> Optional[str]:
     if hasattr(file_obj, "name") and isinstance(file_obj.name, str) and file_obj.name.strip():
         return file_obj.name.strip()
     if isinstance(file_obj, dict):
-        if "path" in file_obj and isinstance(file_obj["path"], str) and file_obj["path"].strip():
+        if "path" in file_obj and isinstance(file_obj["path"], str):
             return file_obj["path"].strip()
-        if "name" in file_obj and isinstance(file_obj["name"], str) and file_obj["name"].strip():
+        if "name" in file_obj and isinstance(file_obj["name"], str):
             return file_obj["name"].strip()
     if isinstance(file_obj, (list, tuple)) and len(file_obj) > 0:
         return extract_uploaded_path(file_obj[0])
@@ -1229,7 +922,6 @@ def get_dashboard_state() -> Tuple[str, float, str, Optional[str], Any, Any]:
     with job_manager.lock:
         if job_manager.status in ["STARTING", "PARSING_SRT", "GENERATING_TTS", "SYNCING_AUDIO"]:
             if not job_manager.worker_thread or not job_manager.worker_thread.is_alive():
-                # Zombie job from a past session / server reboot! Auto-reset to IDLE
                 job_manager.status = "IDLE"
                 job_manager.progress = 0.0
                 job_manager.job_id = None
@@ -1245,14 +937,14 @@ def get_dashboard_state() -> Tuple[str, float, str, Optional[str], Any, Any]:
     progress = state["progress"]
     message = state["message"]
     elapsed = state["elapsed_sec"]
-    logs = "\n".join(state["logs"]) if state["logs"] else "System ready for Indic-F5 dubbing."
+    logs = "\n".join(state["logs"]) if state["logs"] else "System ready for Indic-F5 batch dubbing."
     completed = state["completed_file"]
 
     status_config = {
         "IDLE": {"label": "STANDBY", "dot_color": "#94a3b8", "bg": "rgba(148, 163, 184, 0.12)", "border": "rgba(148, 163, 184, 0.25)", "text": "#94a3b8"},
         "STARTING": {"label": "INITIALIZING", "dot_color": "#38bdf8", "bg": "rgba(56, 189, 248, 0.12)", "border": "rgba(56, 189, 248, 0.25)", "text": "#38bdf8"},
         "PARSING_SRT": {"label": "PARSING SRT", "dot_color": "#f59e0b", "bg": "rgba(245, 158, 11, 0.12)", "border": "rgba(245, 158, 11, 0.25)", "text": "#f59e0b"},
-        "GENERATING_TTS": {"label": "INDIC-F5 INFERENCE", "dot_color": "#a855f7", "bg": "rgba(168, 85, 247, 0.12)", "border": "rgba(168, 85, 247, 0.25)", "text": "#a855f7"},
+        "GENERATING_TTS": {"label": "T4 BATCH TTS", "dot_color": "#a855f7", "bg": "rgba(168, 85, 247, 0.12)", "border": "rgba(168, 85, 247, 0.25)", "text": "#a855f7"},
         "SYNCING_AUDIO": {"label": "SILENT CANVAS SYNC", "dot_color": "#3b82f6", "bg": "rgba(59, 130, 246, 0.12)", "border": "rgba(59, 130, 246, 0.25)", "text": "#3b82f6"},
         "COMPLETED": {"label": "DUBBING COMPLETE", "dot_color": "#10b981", "bg": "rgba(16, 185, 129, 0.12)", "border": "rgba(16, 185, 129, 0.25)", "text": "#10b981"},
         "FAILED": {"label": "ERROR OCCURRED", "dot_color": "#dc2626", "bg": "rgba(220, 38, 38, 0.12)", "border": "rgba(220, 38, 38, 0.25)", "text": "#dc2626"},
@@ -1261,12 +953,12 @@ def get_dashboard_state() -> Tuple[str, float, str, Optional[str], Any, Any]:
     cfg = status_config.get(status, status_config["IDLE"])
 
     status_md = f"""
-    <div class="status-summary-card" style="background: var(--background-fill-secondary, rgba(125, 125, 125, 0.05)); border: 1px solid {cfg['border']}; border-radius: 10px; padding: 12px 16px; margin-bottom: 8px; min-height: 56px; box-sizing: border-box;">
+    <div style="background: var(--background-fill-secondary, rgba(125, 125, 125, 0.05)); border: 1px solid {cfg['border']}; border-radius: 10px; padding: 12px 16px; margin-bottom: 8px;">
         <div style="display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 10px;">
             <div style="display: flex; align-items: center; gap: 10px;">
                 <div style="display: flex; align-items: center; gap: 6px; background: {cfg['bg']}; border: 1px solid {cfg['border']}; padding: 4px 12px; border-radius: 9999px;">
                     <span class="radar-dot" style="background-color: {cfg['dot_color']};"></span>
-                    <span style="color: {cfg['text']}; font-weight: 700; font-size: 0.82rem; letter-spacing: 0.03em;">{cfg['label']}</span>
+                    <span style="color: {cfg['text']}; font-weight: 700; font-size: 0.82rem;">{cfg['label']}</span>
                 </div>
                 <span style="font-size: 0.92rem; font-weight: 500;">{message}</span>
             </div>
@@ -1298,49 +990,30 @@ def get_dashboard_state() -> Tuple[str, float, str, Optional[str], Any, Any]:
     )
 
 
-# ─── REQUIREMENT 2: UI MODIFICATION (MANUAL DURATION IN HH:MM:SS) ─────────────
+# ─── SYNCHRONOUS PRE-FLIGHT SRT PARSER HANDLER ───────────────────────────────
 def start_pipeline_handler(total_duration: Any, srt_file: Any):
-    """Initiates dubbing job with manual duration (HH:MM:SS) and yields live status updates."""
+    """Synchronous pre-flight check of SRT file before starting background worker."""
     srt_path = extract_uploaded_path(srt_file)
     duration_val = parse_duration_to_seconds(total_duration)
 
-    if not srt_path:
-        gr.Warning("⚠️ Please upload the Translated Subtitle File (.srt) first.")
-        job_manager.status = "FAILED"
-        job_manager.message = "No subtitle file provided. Please upload a .srt file."
-        job_manager.save_to_disk()
-        yield get_dashboard_state()
-        return
-
-    # Check file exists and is readable on disk before starting worker
-    if not os.path.exists(srt_path):
-        err_msg = f"Subtitle file '{os.path.basename(srt_path)}' was not found on disk. Please re-upload your .srt file."
-        gr.Warning(f"❌ {err_msg}")
-        job_manager.status = "FAILED"
-        job_manager.message = err_msg
-        job_manager.log(f"❌ {err_msg}", level="ERROR")
-        job_manager.save_to_disk()
-        yield get_dashboard_state()
-        return
-
-    # Synchronous pre-flight validation of the SRT file
+    # 1. ROBUST SYNCHRONOUS SRT PARSER (THE FIX)
     try:
-        test_blocks = parse_srt(srt_path)
-        if not test_blocks:
-            raise ValueError("No valid dialogue lines found in the uploaded subtitle file.")
+        blocks = parse_srt_synchronous(srt_path)
     except Exception as validation_err:
-        err_msg = f"SRT Validation Error: {validation_err}"
+        err_msg = str(validation_err)
         gr.Warning(f"❌ {err_msg}")
         job_manager.status = "FAILED"
         job_manager.message = err_msg
-        job_manager.log(f"❌ {err_msg}", level="ERROR")
+        job_manager.log(f"❌ Subtitle Validation Error: {err_msg}", level="ERROR")
         job_manager.save_to_disk()
         yield get_dashboard_state()
         return
 
+    # 2. Launch background worker with verified blocks
     success, msg = job_manager.start_job(
         total_duration=duration_val,
         srt_file_path=srt_path,
+        blocks=blocks,
     )
     if not success:
         gr.Warning(f"⚠️ {msg}")
@@ -1369,39 +1042,33 @@ def reset_pipeline_handler():
     return get_dashboard_state()
 
 
-# ─── GRADIO APPLICATION LAYOUT ───────────────────────────────────────────────
-with gr.Blocks(theme=gr.themes.Default(), css=CUSTOM_CSS, title="Indic-F5 Audio Studio") as demo:
+# ─── GRADIO BLOCKS APPLICATION ───────────────────────────────────────────────
+with gr.Blocks(theme=gr.themes.Default(), css=CUSTOM_CSS, title="Indic-F5 Colab Studio") as demo:
     # 1. Header Banner
     gr.HTML(
         """
-        <div style="border-bottom: 1px solid var(--border-color-primary, #e2e8f0); padding-bottom: 16px; margin-bottom: 20px;">
-            <div style="display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 10px;">
+        <div style="border-bottom: 1px solid var(--border-color-primary, #334155); padding-bottom: 14px; margin-bottom: 18px;">
+            <div style="display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 8px;">
                 <div>
                     <div style="display: flex; align-items: center; gap: 8px; margin-bottom: 4px;">
-                        <span style="font-size: 0.76rem; font-weight: 700; border: 1px solid #a855f7; color: #a855f7; padding: 2px 8px; border-radius: 6px;">⚡ INDIC-F5 (0.3B)</span>
-                        <span style="font-size: 0.76rem; font-weight: 700; border: 1px solid #10b981; color: #10b981; padding: 2px 8px; border-radius: 6px;"><span class="radar-dot" style="background-color: #10b981;"></span> ENGINE ONLINE</span>
+                        <span style="font-size: 0.76rem; font-weight: 700; border: 1px solid #10b981; color: #10b981; padding: 2px 8px; border-radius: 6px;">⚡ T4 GPU ACCELERATED</span>
+                        <span style="font-size: 0.76rem; font-weight: 700; border: 1px solid #a855f7; color: #a855f7; padding: 2px 8px; border-radius: 6px;">📦 BATCH SIZE: 15-20</span>
+                        <span style="font-size: 0.76rem; font-weight: 700; border: 1px solid #38bdf8; color: #38bdf8; padding: 2px 8px; border-radius: 6px;">🛡️ DYNAMIC OOM FALLBACK</span>
                     </div>
-                    <h1 style="font-size: 1.75rem; font-weight: 800; margin: 0; color: var(--body-text-color, #0f172a);">🎙️ Indic-F5 Audio Studio</h1>
-                    <p style="font-size: 0.92rem; color: #64748b; margin: 4px 0 0 0;">Hindi-English Code-Switched 0.3B Model & FFmpeg Silent Canvas Timeline Sync</p>
+                    <h1 style="font-size: 1.85rem; font-weight: 800; margin: 0; color: var(--body-text-color, #f8fafc);">🎙️ Indic-F5 Audio Studio</h1>
+                    <p style="font-size: 0.95rem; color: #94a3b8; margin: 4px 0 0 0;">Google Colab T4 Edition — High-Throughput Batch Dubber & Silent Canvas Alignment</p>
                 </div>
-            </div>
-            <div style="display: flex; flex-wrap: wrap; gap: 8px; margin-top: 12px;">
-                <span style="font-size: 0.75rem; border: 1px solid var(--border-color-primary, #e2e8f0); padding: 3px 10px; border-radius: 9999px;">🗣️ Tharshan/indicf5_hindi-english_code_switch</span>
-                <span style="font-size: 0.75rem; border: 1px solid var(--border-color-primary, #e2e8f0); padding: 3px 10px; border-radius: 9999px;">🔇 FFmpeg anullsrc Silent Canvas</span>
-                <span style="font-size: 0.75rem; border: 1px solid var(--border-color-primary, #e2e8f0); padding: 3px 10px; border-radius: 9999px;">🎯 Sample-Accurate SRT Start Time Sync</span>
-                <span style="font-size: 0.75rem; border: 1px solid var(--border-color-primary, #e2e8f0); padding: 3px 10px; border-radius: 9999px;">🛡️ 0 KB Crash Protection</span>
-                <span style="font-size: 0.75rem; border: 1px solid var(--border-color-primary, #e2e8f0); padding: 3px 10px; border-radius: 9999px;">⚡ Zero LLM / Zero ASR Overhead</span>
             </div>
         </div>
         """
     )
 
-    # 2. Main Workstation: Exactly TWO Inputs (Manual Duration & SRT File)
+    # 2. Main Workstation
     with gr.Row():
         with gr.Column(scale=5, elem_classes=["studio-panel"]):
-            gr.Markdown("### ⏱️ 1. Total Video Duration (HH:MM:SS)")
+            gr.Markdown("### ⏱️ 1. Total Video Duration")
             total_duration_input = gr.Textbox(
-                label="Total Video Duration (Hours:Min:Sec)",
+                label="Total Video Duration (HH:MM:SS or Seconds)",
                 value="00:02:00",
                 placeholder="HH:MM:SS (e.g. 01:30:00 or 00:02:00)",
                 interactive=True,
@@ -1409,14 +1076,13 @@ with gr.Blocks(theme=gr.themes.Default(), css=CUSTOM_CSS, title="Indic-F5 Audio 
             gr.Markdown(
                 """
                 <div style='font-size: 0.82rem; opacity: 0.75; margin-top: 4px;'>
-                    🔇 <b>Format:</b> <code>HH:MM:SS</code> (Hours:Minutes:Seconds, e.g., <code>01:30:00</code> for 1 hr 30 min, <code>00:02:00</code> for 2 min).
-                    FFmpeg generates an exact silent track (<code>anullsrc</code>) matching this duration.
+                    🔇 <b>Silent Base:</b> FFmpeg generates an exact silent track (<code>anullsrc</code>) matching this duration.
                 </div>
                 """
             )
 
         with gr.Column(scale=7, elem_classes=["studio-panel"]):
-            gr.Markdown("### 📝 2. Translated Subtitle File")
+            gr.Markdown("### 📝 2. Translated Subtitle File (.srt)")
             srt_file_input = gr.File(
                 label="Select or Drag & Drop Translated Subtitle (.srt)",
                 file_types=[".srt", ".txt"],
@@ -1427,7 +1093,7 @@ with gr.Blocks(theme=gr.themes.Default(), css=CUSTOM_CSS, title="Indic-F5 Audio 
             gr.Markdown(
                 """
                 <div style='font-size: 0.82rem; opacity: 0.75; margin-top: 4px;'>
-                    ⏱️ <b>Sentence-Level Sync:</b> Each subtitle block is synthesized with Indic-F5 (0.3B) and placed at its exact SRT start_time onto the silent timeline.
+                    🛡️ <b>Pre-Flight Guard:</b> Multi-encoding safe reader validates subtitle syntax immediately before processing.
                 </div>
                 """
             )
@@ -1449,7 +1115,7 @@ with gr.Blocks(theme=gr.themes.Default(), css=CUSTOM_CSS, title="Indic-F5 Audio 
         interactive=False,
     )
 
-    # 4. Final Output: Exactly ONE Output Audio Master (.wav)
+    # 4. Final Output Master
     with gr.Row(elem_classes=["studio-panel"]):
         with gr.Column(scale=12):
             gr.Markdown("### 🎧 Final Dubbed Audio Master")
@@ -1459,25 +1125,25 @@ with gr.Blocks(theme=gr.themes.Default(), css=CUSTOM_CSS, title="Indic-F5 Audio 
                 interactive=False,
             )
 
-    # 5. Live Console Log Box
+    # 5. Live Activity Logs Console
     with gr.Row(elem_classes=["studio-panel"]):
         with gr.Column(scale=12):
-            gr.Markdown("### 📋 Studio Console Log")
-            log_box = gr.Textbox(
-                label="Live Pipeline Log Feed",
-                interactive=False,
-                lines=10,
+            gr.Markdown("### 📜 Real-Time Studio Logs")
+            logs_console = gr.Textbox(
+                label="Live Activity Stream",
+                value="System initialized and ready.",
+                lines=9,
+                max_lines=12,
                 elem_classes=["fixed-log-console"],
+                interactive=False,
+                autoscroll=True,
             )
 
-    # Auto-Polling Timer
-    auto_timer = gr.Timer(value=2.0)
-
-    # Outputs Mapping
+    # Handlers & Timers
     ui_outputs = [
         status_display,
         progress_bar,
-        log_box,
+        logs_console,
         output_audio_master,
         start_btn,
         cancel_btn,
@@ -1487,7 +1153,6 @@ with gr.Blocks(theme=gr.themes.Default(), css=CUSTOM_CSS, title="Indic-F5 Audio 
         fn=start_pipeline_handler,
         inputs=[total_duration_input, srt_file_input],
         outputs=ui_outputs,
-        show_progress="hidden",
     )
 
     cancel_btn.click(
@@ -1511,6 +1176,7 @@ with gr.Blocks(theme=gr.themes.Default(), css=CUSTOM_CSS, title="Indic-F5 Audio 
         show_progress="hidden",
     )
 
+    auto_timer = gr.Timer(value=1.0)
     auto_timer.tick(
         fn=get_dashboard_state,
         inputs=[],
@@ -1522,17 +1188,9 @@ with gr.Blocks(theme=gr.themes.Default(), css=CUSTOM_CSS, title="Indic-F5 Audio 
         fn=get_dashboard_state,
         inputs=[],
         outputs=ui_outputs,
-        show_progress="hidden",
     )
 
-
-# ─── APP ENTRYPOINT ────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     ensure_reference_audio()
-    ensure_vocab_file()
-    # Auto-purge any stale/zombie job state from prior session
     job_manager.reset_job()
     demo.launch(share=True)
-
-
-

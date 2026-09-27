@@ -385,22 +385,52 @@ class IndicF5Generator:
         if model is not None:
             try:
                 batch_results = self.generate_batch(batch_texts, manager=manager)
-            except torch.cuda.OutOfMemoryError:
-                if manager:
-                    manager.log("⚠️ [Indic-F5 GPU] CUDA OOM encountered. Flushing VRAM and splitting batch in half...", level="WARNING")
-                torch.cuda.empty_cache()
-                gc.collect()
-                if len(batch_blocks) > 1:
-                    mid = len(batch_blocks) // 2
-                    res1 = self.synthesize_batch(batch_blocks[:mid], manager=manager)
-                    res2 = self.synthesize_batch(batch_blocks[mid:], manager=manager)
-                    return res1 + res2
+            except RuntimeError as e:
+                if "OutOfMemory" in str(e) or "CUDA out of memory" in str(e) or "out of memory" in str(e).lower():
+                    if manager:
+                        manager.log(
+                            f"⚠️ [Dynamic Memory Fallback] CUDA Out of Memory with batch size {len(batch_blocks)}. "
+                            f"Clearing cache and halving batch size to retry immediately...",
+                            level="WARNING",
+                        )
+                    if torch and hasattr(torch, "cuda") and torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+                    gc.collect()
+
+                    if len(batch_blocks) > 1:
+                        mid = len(batch_blocks) // 2
+                        first_half = self.synthesize_batch(batch_blocks[:mid], manager=manager)
+                        second_half = self.synthesize_batch(batch_blocks[mid:], manager=manager)
+                        return first_half + second_half
+                    else:
+                        batch_results = None
                 else:
+                    if manager:
+                        manager.log(f"⚠️ [Indic-F5 Batch] RuntimeError during parallel generation: {e}", level="WARNING")
                     batch_results = None
             except Exception as batch_err:
-                if manager:
-                    manager.log(f"⚠️ [Indic-F5 Batch] Notice during parallel generation: {batch_err}. Falling back to individual synthesis.", level="WARNING")
-                batch_results = None
+                if "OutOfMemory" in str(batch_err) or "CUDA out of memory" in str(batch_err) or "out of memory" in str(batch_err).lower():
+                    if manager:
+                        manager.log(
+                            f"⚠️ [Dynamic Memory Fallback] OOM encountered with batch size {len(batch_blocks)}. "
+                            f"Clearing cache and halving batch size to retry immediately...",
+                            level="WARNING",
+                        )
+                    if torch and hasattr(torch, "cuda") and torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+                    gc.collect()
+
+                    if len(batch_blocks) > 1:
+                        mid = len(batch_blocks) // 2
+                        first_half = self.synthesize_batch(batch_blocks[:mid], manager=manager)
+                        second_half = self.synthesize_batch(batch_blocks[mid:], manager=manager)
+                        return first_half + second_half
+                    else:
+                        batch_results = None
+                else:
+                    if manager:
+                        manager.log(f"⚠️ [Indic-F5 Batch] Notice during parallel generation: {batch_err}. Falling back to individual synthesis.", level="WARNING")
+                    batch_results = None
 
         # Process and verify generated files with 0 KB crash check
         import soundfile as sf
@@ -507,7 +537,7 @@ class IndicF5Generator:
 
 # ─── BATCH SIZE & HARDWARE ACCELERATION HELPERS ──────────────────────────────
 def get_optimal_batch_size() -> int:
-    """Computes optimal batch size to push GPU VRAM utilization to ~8-10 GB on T4."""
+    """Computes aggressive batch size (35 on T4) to maximize GPU VRAM utilization to 70-80%."""
     import torch
     if not torch.cuda.is_available():
         return 2
@@ -515,13 +545,13 @@ def get_optimal_batch_size() -> int:
     try:
         total_vram_gb = torch.cuda.get_device_properties(0).total_memory / (1024**3)
         if total_vram_gb >= 14.0:  # e.g. T4 (15.3GB), V100 (16GB), A10 (24GB)
-            return 10  # Optimal for 8-10 GB VRAM utilization
+            return 35  # Aggressive batch size to force 70-80% GPU VRAM utilization
         elif total_vram_gb >= 8.0:
-            return 6
+            return 16
         else:
-            return 4
+            return 8
     except Exception:
-        return 8
+        return 35
 
 
 def get_vram_usage_str() -> str:
@@ -869,8 +899,8 @@ def run_indic_dubbing_worker(
         batch_size = get_optimal_batch_size()
         vram_start = get_vram_usage_str()
         manager.log(
-            f"⚡ [Indic-F5] Initializing Parallel Batch Inference (batch_size={batch_size}, "
-            f"Target VRAM: 8-10 GB){vram_start}"
+            f"⚡ [Indic-F5] Initializing Aggressive Parallel Batch Inference (batch_size={batch_size}, "
+            f"Target VRAM: 70-80%){vram_start}"
         )
 
         # Pre-assign individual target destination filepaths to preserve 1:1 mapping with SRT block IDs
